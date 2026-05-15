@@ -39,13 +39,18 @@ CLI:
     node dist/xsquared.js dashboard --port 3888
     node dist/xsquared.js post <post-id>
 
-The dashboard supports setting a posting area, analyzing trends for that area, generating draft candidates, editing drafts, recording rewrite requests for OpenClaw, inspecting what xsquared has learned about your writing style, and posting approved drafts through birdclaw compose post.
+The dashboard splits generation and review into two sources:
+
+- Topic: define one or many topics, add angle/reference material, and generate posts for the selected topic.
+- Trending: fetch viral or relevant feed posts, select the ones worth adapting, and generate your versions.
+
+The Posts tab groups drafts by Topic and Trending. It supports editing drafts, recording rewrite requests for OpenClaw, inspecting what xsquared has learned about your writing style, and posting approved drafts through birdclaw compose post.
 
 The automatic content loop is intentionally simple for the first version:
 
-1. Save a posting area, such as "Google Ads for small business".
-2. xsquared asks Birdclaw for current local X trend/context around that area.
-3. xsquared combines the trend terms with the latest writing-profile snapshot.
+1. Use Topic when you already know what you want to post about, such as "Google Ads for small business".
+2. Use Trending when you want xsquared to pull relevant feed posts and help recreate your version of what is working.
+3. xsquared combines the selected source with the latest writing-profile snapshot.
 4. It saves draft posts locally for review and rewrite.
 
 Profile learning uses Birdclaw's local authored-tweet store. If the Profile tab shows zero tweets, import your X archive into Birdclaw or run Birdclaw authored sync first, then click Learn Profile again.

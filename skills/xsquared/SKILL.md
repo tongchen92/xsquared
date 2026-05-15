@@ -5,7 +5,7 @@ description: Create, rewrite, review, and publish X posts through xsquared using
 
 # xsquared
 
-Use xsquared to create X content from Birdclaw context plus the user's topic or objective.
+Use xsquared to create X content from either user-defined topics or trending/feed posts that are relevant enough to adapt.
 
 ## Guardrails
 
@@ -33,7 +33,12 @@ Draft/profile store:
 
     npm run check
 
-2. Save or inspect the user's posting area when they provide one:
+2. Choose the source:
+
+- Topic: the user defines one or many topics and reviews drafts created for that topic.
+- Trending: xsquared pulls viral/relevant feed posts and creates the user's version of selected posts.
+
+3. Save or inspect the user's posting area when they provide one:
 
     npm run build
     node dist/xsquared.js strategy-set --area "<area>" --json
@@ -41,17 +46,17 @@ Draft/profile store:
 
 For example: Google Ads for small business.
 
-3. Gather trend/context signal. If the user gave a topic, include it:
+4. Gather trend/context signal. If the user gave a topic, include it:
 
     node dist/xsquared.js trends --topic "<topic>" --limit 40 --json
 
-4. Learn the user's writing style when authored tweets are available in Birdclaw:
+5. Learn the user's writing style when authored tweets are available in Birdclaw:
 
     node dist/xsquared.js profile-learn --handle "@<handle>" --limit 200 --json
 
 If this returns zero tweets, tell the user Birdclaw needs an X archive import or authored sync before xsquared can learn from their history.
 
-5. Generate 3-8 strong X post candidates:
+6. Generate 3-8 strong X post candidates:
 
     node dist/xsquared.js generate --area "<area>" --count 5 --json
 
@@ -65,7 +70,7 @@ Prefer:
 - Avoid hashtags unless the topic strongly benefits.
 - Match the latest profile snapshot's length, line-break, hashtag, link, and hook patterns when available.
 
-6. Save manually generated candidates:
+7. Save manually generated candidates:
 
     node dist/xsquared.js save --topic "<topic>" --angle "<angle>" --score <1-100> --text "<post text>"
 
@@ -75,7 +80,7 @@ For batches, write JSON to a temp file and import:
 
 The JSON can be either an array of posts or { "posts": [...] } where each post has text, and optional topic, angle, score, notes, and source.
 
-7. Show the dashboard when useful:
+8. Show the dashboard when useful:
 
     npm run dashboard
 

@@ -450,7 +450,7 @@ function fetchFeedSnapshot(opts) {
 }
 
 function saveDirection(input) {
-  if (!String(input.name || "").trim()) throw new Error("direction name is required");
+  if (!String(input.name || "").trim()) throw new Error("topic name is required");
   const store = readStore();
   const direction = {
     id: makeId("dir"),
@@ -469,7 +469,7 @@ function saveDirection(input) {
 function updateDirection(id, updates) {
   const store = readStore();
   const direction = store.directions.find(function(d) { return d.id === id; });
-  if (!direction) throw new Error("direction not found: " + id);
+  if (!direction) throw new Error("topic not found: " + id);
   if (updates.name !== undefined && String(updates.name).trim()) direction.name = String(updates.name).trim();
   if (updates.description !== undefined) direction.description = String(updates.description).trim();
   if (updates.references !== undefined) direction.references = Array.isArray(updates.references) ? updates.references.filter(Boolean) : (updates.references ? [String(updates.references)] : []);
@@ -482,7 +482,7 @@ function updateDirection(id, updates) {
 function deleteDirection(id) {
   const store = readStore();
   const idx = store.directions.findIndex(function(d) { return d.id === id; });
-  if (idx === -1) throw new Error("direction not found: " + id);
+  if (idx === -1) throw new Error("topic not found: " + id);
   store.directions.splice(idx, 1);
   writeStore(store);
   return { deleted: id };
@@ -524,9 +524,9 @@ function makeFeedInspiredTexts(selectedPosts, area, profileSnapshot, count) {
       angle,
       score: Math.max(70, 85 - index * 2),
       text: trimmed,
-      notes: "Inspired by feed post: " + postSnippet + (post.url ? " — " + post.url : ""),
+      notes: "Inspired by trending post: " + postSnippet + (post.url ? " — " + post.url : ""),
       source: "xsquared-generator",
-      generationSource: "feed-inspired",
+      generationSource: "trending",
       inspirationPosts: [{ id: post.id, author: post.author, text: String(post.text || "").slice(0, 200), url: post.url }],
       directionId: null
     };
@@ -560,9 +560,9 @@ function makeDirectionTexts(direction, profileSnapshot, count) {
       angle: angles[index % angles.length],
       score: Math.max(72, 88 - index * 2),
       text: trimmed,
-      notes: "Direction: " + name + (description ? " — " + description.slice(0, 100) : "") + (refTerms.length ? ". Key terms: " + refTerms.join(", ") : "") + ".",
+      notes: "Topic: " + name + (description ? " — " + description.slice(0, 100) : "") + (refTerms.length ? ". Key terms: " + refTerms.join(", ") : "") + ".",
       source: "xsquared-generator",
-      generationSource: "direction",
+      generationSource: "topic",
       inspirationPosts: [],
       directionId: direction.id
     };
@@ -577,7 +577,7 @@ function generateFromFeed(body) {
   const feedSnapshot = feedSnapshotId
     ? store.feedSnapshots.find(function(s) { return s.id === feedSnapshotId; })
     : store.feedSnapshots[0];
-  if (!feedSnapshot) throw new Error("no feed posts found; fetch feed first");
+  if (!feedSnapshot) throw new Error("no trending posts found; fetch trending first");
   const selectedIds = Array.isArray(body.selectedPostIds) ? body.selectedPostIds : [];
   const selectedPosts = selectedIds.length
     ? feedSnapshot.posts.filter(function(p) { return selectedIds.includes(p.id); })
@@ -598,7 +598,7 @@ function generateFromFeed(body) {
     trendSnapshotId: feedSnapshot.id,
     profileSnapshotId: latestProfile ? latestProfile.id : null,
     postIds: drafts.map(function(post) { return post.id; }),
-    note: "Feed-inspired generation. Source: " + feedSnapshot.id + ". Ask OpenClaw to rewrite with your voice."
+    note: "Trending-source generation. Source: " + feedSnapshot.id + ". Ask OpenClaw to rewrite with your voice."
   };
   store.generationSnapshots.unshift(generation);
   store.generationSnapshots = store.generationSnapshots.slice(0, 50);
@@ -612,7 +612,7 @@ function generateFromDirection(body) {
   const direction = directionId
     ? store.directions.find(function(d) { return d.id === directionId; })
     : store.directions[0];
-  if (!direction) throw new Error("direction not found; create a direction first");
+  if (!direction) throw new Error("topic not found; create a topic first");
   const count = Number(body.count || 5);
   const latestProfile = store.profileSnapshots[0] || null;
   const drafts = makeDirectionTexts(direction, latestProfile, count).map(function(input) {
@@ -628,7 +628,7 @@ function generateFromDirection(body) {
     trendSnapshotId: null,
     profileSnapshotId: latestProfile ? latestProfile.id : null,
     postIds: drafts.map(function(post) { return post.id; }),
-    note: "Direction-based generation: " + direction.name + ". Ask OpenClaw to rewrite with your voice."
+    note: "Topic-source generation: " + direction.name + ". Ask OpenClaw to rewrite with your voice."
   };
   store.generationSnapshots.unshift(generation);
   store.generationSnapshots = store.generationSnapshots.slice(0, 50);
@@ -737,13 +737,13 @@ function html() {
 
   const HEADER = "<header><div class=\"bar\"><div class=\"brand\"><h1><span class=\"brand-mark\">x</span>squared</h1><span class=\"brand-tag\">drafts</span></div><nav class=\"nav-tabs\" aria-label=\"Primary\"><button class=\"nav-tab active\" data-tab=\"posts\">Posts</button><button class=\"nav-tab\" data-tab=\"generate\">Generate</button><button class=\"nav-tab\" data-tab=\"profile\">Profile</button></nav><div class=\"tools\"><button id=\"doctor\" class=\"ghost\">Doctor</button><button id=\"refresh\" class=\"ghost\">Refresh</button></div></div></header>";
 
-  const SIDEBAR_POSTS = "<section class=\"panel\" id=\"compose-panel\"><h2 class=\"panel-head\">Compose</h2><div class=\"field\"><label>Posting area</label><textarea id=\"contentArea\" placeholder=\"Google Ads for small business\"></textarea></div><div class=\"row\"><button id=\"saveArea\">Save area</button><button id=\"generateDrafts\" class=\"accent\">Generate drafts</button></div></section><section class=\"panel\" id=\"newdraft-panel\"><h2 class=\"panel-head\">New draft</h2><div class=\"field\"><label>Text</label><textarea id=\"newText\" placeholder=\"Paste or write a draft...\"></textarea></div><div class=\"field\"><label>Angle</label><input id=\"angle\" placeholder=\"contrarian, tactical, founder lesson...\"></div><div class=\"row\"><button id=\"saveNew\" class=\"primary\">Save draft</button></div></section><section class=\"panel\" id=\"research-panel\"><h2 class=\"panel-head\">Research</h2><div class=\"field\"><label>Topic</label><input id=\"topic\" placeholder=\"AI agents, local business ops...\"></div><div class=\"row\"><button id=\"scan\">Analyze trends</button></div><div id=\"trends\" class=\"trend-list\" style=\"margin-top:14px\"></div></section><section class=\"panel\" id=\"profile-panel\"><h2 class=\"panel-head\">Profile learning</h2><div class=\"field\"><label>X handle</label><input id=\"handle\" placeholder=\"@tongchen92\"></div><div class=\"row\"><button id=\"learnProfile\">Learn profile</button></div></section>";
+  const SIDEBAR_POSTS = "<section class=\"panel\" id=\"profile-panel\"><h2 class=\"panel-head\">Profile learning</h2><div class=\"field\"><label>X handle</label><input id=\"handle\" placeholder=\"@tongchen92\"></div><div class=\"row\"><button id=\"learnProfile\">Learn profile</button></div></section>";
 
-  const SIDEBAR_GEN = "<div id=\"gen-side\" style=\"display:none\"><section class=\"panel\"><h2 class=\"panel-head\">Source</h2><div class=\"source-tabs\"><button class=\"source-tab active\" data-source=\"feed\">From Feed</button><button class=\"source-tab\" data-source=\"direction\">From Direction</button></div><div id=\"feed-side\"><div class=\"field\"><label>Topic (optional)</label><input id=\"feedTopic\" placeholder=\"Leave empty for home timeline\"></div><div class=\"row\" style=\"margin-bottom:12px\"><button id=\"fetchFeedBtn\" class=\"primary\">Fetch posts</button></div><div id=\"feedSideMeta\" style=\"font-size:12px;color:var(--muted)\"></div><div id=\"feedGenerateSide\" style=\"display:none;margin-top:12px\"><div class=\"field\"><label>Posting area</label><input id=\"feedArea\" placeholder=\"Google Ads for small business\"></div><button id=\"genFromFeedBtn\" class=\"accent\" style=\"width:100%\">Generate my takes</button></div></div><div id=\"direction-side\" style=\"display:none\"><button id=\"newDirBtn\" class=\"primary\" style=\"width:100%;margin-bottom:10px\">+ New direction</button><div id=\"dirSideMeta\" style=\"font-size:12px;color:var(--muted);margin-bottom:8px\">Select a direction to generate from it.</div><div id=\"dirGenerateSide\" style=\"display:none\"><button id=\"genFromDirBtn\" class=\"accent\" style=\"width:100%\">Generate deep dive</button></div></div></section></div>";
+  const SIDEBAR_GEN = "<div id=\"gen-side\" style=\"display:none\"><section class=\"panel\"><h2 class=\"panel-head\">Source</h2><div class=\"source-tabs\"><button class=\"source-tab active\" data-source=\"direction\">Topic</button><button class=\"source-tab\" data-source=\"feed\">Trending</button></div><div id=\"direction-side\"><button id=\"newDirBtn\" class=\"primary\" style=\"width:100%;margin-bottom:10px\">+ New topic</button><div id=\"dirSideMeta\" style=\"font-size:12px;color:var(--muted);margin-bottom:8px\">Select a topic to generate from it.</div><div id=\"dirGenerateSide\" style=\"display:none\"><button id=\"genFromDirBtn\" class=\"accent\" style=\"width:100%\">Generate topic posts</button></div></div><div id=\"feed-side\" style=\"display:none\"><div class=\"field\"><label>Trending filter</label><input id=\"feedTopic\" placeholder=\"Optional: Google Ads, AI agents...\"></div><div class=\"row\" style=\"margin-bottom:12px\"><button id=\"fetchFeedBtn\" class=\"primary\">Fetch trending posts</button></div><div id=\"feedSideMeta\" style=\"font-size:12px;color:var(--muted)\"></div><div id=\"feedGenerateSide\" style=\"display:none;margin-top:12px\"><div class=\"field\"><label>Your angle / topic</label><input id=\"feedArea\" placeholder=\"Google Ads for small business\"></div><button id=\"genFromFeedBtn\" class=\"accent\" style=\"width:100%\">Generate my versions</button></div></div></section></div>";
 
   const SIDEBAR_SYS = "<section class=\"panel\"><h2 class=\"panel-head\">System</h2><div id=\"status\" class=\"status-bar\">Ready.</div></section>";
 
-  const CONTENT_GEN = "<div id=\"generate\" style=\"display:none\"><div id=\"gen-feed-view\"><div id=\"feed-sel-bar\" class=\"sel-bar\" style=\"display:none\"><span class=\"sel-count\" id=\"feedSelCount\">0 selected</span><span style=\"font-size:12px;color:var(--muted)\">Click posts to select · drafts go to Posts tab</span></div><div id=\"feed-posts-grid\" class=\"feed-grid\"></div><div id=\"feed-empty\" class=\"empty\"><div class=\"empty-title\">No feed posts yet.</div><div class=\"empty-body\">Enter a topic (optional) and click <b>Fetch posts</b> to pull from your home timeline. Select relevant posts, then click <b>Generate my takes</b>.</div></div></div><div id=\"gen-dir-view\" style=\"display:none\"><div id=\"dir-editor-card\" class=\"post\" style=\"display:none;margin-bottom:14px\"><div class=\"meta\"><span id=\"dirEditLabel\" class=\"pill\">New direction</span></div><div class=\"field\"><label>Name</label><input id=\"dirName\" placeholder=\"Google Ads depth, AI product strategy...\"></div><div class=\"field\"><label>Description / angle</label><textarea id=\"dirDesc\" style=\"min-height:80px\" placeholder=\"What specific angle or claim do you want to develop?\"></textarea></div><div class=\"field\"><label>Reference material</label><textarea id=\"dirRefs\" style=\"min-height:180px\" placeholder=\"Paste articles, notes, research, data points... Separate multiple references with a line containing only ---\"></textarea></div><div class=\"field\"><label style=\"display:flex;align-items:center;gap:8px;cursor:pointer\"><input type=\"checkbox\" id=\"dirUseTweets\" style=\"width:auto\"> Use my tweet samples for voice context</label></div><div class=\"row\"><button id=\"saveDirBtn\" class=\"primary\">Save</button><button id=\"cancelDirBtn\" class=\"ghost\">Cancel</button><button id=\"deleteDirBtn\" class=\"danger-confirm\" style=\"display:none\">Delete</button></div></div><div id=\"dir-grid\" class=\"dir-grid\"></div><div id=\"dir-empty\" class=\"empty\" style=\"display:none\"><div class=\"empty-title\">No directions yet.</div><div class=\"empty-body\">Click <b>+ New direction</b> to set a topic you want to go deep on. Add reference material and your angle — then generate rich drafts.</div></div></div></div>";
+  const CONTENT_GEN = "<div id=\"generate\" style=\"display:none\"><div id=\"gen-dir-view\"><div id=\"dir-editor-card\" class=\"post\" style=\"display:none;margin-bottom:14px\"><div class=\"meta\"><span id=\"dirEditLabel\" class=\"pill\">New topic</span></div><div class=\"field\"><label>Topic name</label><input id=\"dirName\" placeholder=\"Google Ads for small business\"></div><div class=\"field\"><label>Angle / objective</label><textarea id=\"dirDesc\" style=\"min-height:80px\" placeholder=\"What specific angle or claim do you want posts about?\"></textarea></div><div class=\"field\"><label>Reference material</label><textarea id=\"dirRefs\" style=\"min-height:180px\" placeholder=\"Paste notes, research, examples, constraints... Separate multiple references with a line containing only ---\"></textarea></div><div class=\"field\"><label style=\"display:flex;align-items:center;gap:8px;cursor:pointer\"><input type=\"checkbox\" id=\"dirUseTweets\" style=\"width:auto\"> Use my tweet samples for voice context</label></div><div class=\"row\"><button id=\"saveDirBtn\" class=\"primary\">Save topic</button><button id=\"cancelDirBtn\" class=\"ghost\">Cancel</button><button id=\"deleteDirBtn\" class=\"danger-confirm\" style=\"display:none\">Delete</button></div></div><div id=\"dir-grid\" class=\"dir-grid\"></div><div id=\"dir-empty\" class=\"empty\" style=\"display:none\"><div class=\"empty-title\">No topics yet.</div><div class=\"empty-body\">Click <b>+ New topic</b> to define one or many areas you want to post about, then generate drafts for the selected topic.</div></div></div><div id=\"gen-feed-view\" style=\"display:none\"><div id=\"feed-sel-bar\" class=\"sel-bar\" style=\"display:none\"><span class=\"sel-count\" id=\"feedSelCount\">0 selected</span><span style=\"font-size:12px;color:var(--muted)\">Click viral/relevant posts to select · drafts go to Posts tab</span></div><div id=\"feed-posts-grid\" class=\"feed-grid\"></div><div id=\"feed-empty\" class=\"empty\"><div class=\"empty-title\">No trending posts yet.</div><div class=\"empty-body\">Fetch viral or relevant feed posts, select the ones worth recreating, then generate your versions.</div></div></div></div>";
 
   const JS = `const $=id=>document.getElementById(id);
 let posts=[],profileSnapshots=[],feedSnapshot=null,selectedFeedIds=new Set(),directions=[],activeDirId=null,editingDirId=null;
@@ -754,13 +754,18 @@ function esc(v){return String(v||'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&
 function fmtDate(d){if(!d)return '';const x=new Date(d);const diff=(Date.now()-x.getTime())/1000;if(diff<60)return 'just now';if(diff<3600)return Math.floor(diff/60)+'m ago';if(diff<86400)return Math.floor(diff/3600)+'h ago';if(diff<604800)return Math.floor(diff/86400)+'d ago';return x.toLocaleDateString(undefined,{month:'short',day:'numeric'})}
 function renderPosts(){
   const root=$('posts');
-  if(!posts.length){root.innerHTML='<div class="empty"><div class="empty-title">No drafts yet.</div><div class="empty-body">Use the <b>Generate</b> tab to create feed-inspired or direction-based drafts, or write one under <b>Compose</b>.</div></div>';return}
+  if(!posts.length){root.innerHTML='<div class="empty"><div class="empty-title">No drafts yet.</div><div class="empty-body">Use the <b>Generate</b> tab, then choose <b>Topic</b> or <b>Trending</b>.</div></div>';return}
   const sl=s=>s||'draft';
-  root.innerHTML=posts.map(p=>{
+  function postSource(p){const s=p.generationSource||p.source||'';return (s==='trending'||s==='feed-inspired')?'trending':'topic'}
+  function card(p){
     const st=sl(p.status);
     const srcPill=(p.generationSource&&p.generationSource!=='openclaw'&&p.generationSource!=='dashboard')?'<span class="pill pill-source">'+esc(p.generationSource)+'</span>':'';
     return '<article class="post" data-id="'+esc(p.id)+'"><div class="meta"><span class="pill pill-status" data-status="'+esc(st)+'">'+esc(st)+'</span>'+(p.topic?'<span class="pill">'+esc(p.topic)+'</span>':'')+(p.angle?'<span class="pill">'+esc(p.angle)+'</span>':'')+srcPill+(p.score!=null?'<span class="score">'+esc(p.score)+'</span>':'')+'<span class="ts">'+fmtDate(p.updatedAt||p.createdAt)+'</span></div><textarea data-field="text">'+esc(p.text)+'</textarea>'+(p.notes?'<div class="note-block">'+esc(p.notes)+'</div>':'')+'<div class="field"><label>Rewrite request</label><input data-field="rewrite" placeholder="Sharper, more specific, less hype..."></div><div class="row"><button data-action="save">Save</button><button data-action="rewrite">Ask OpenClaw</button><button data-action="post" class="primary">Post to X</button></div>'+(p.postResult&&!p.postResult.ok?'<div class="failed">'+esc(p.postResult.stderr||p.postResult.error||'Post failed')+'</div>':'')+(p.postedAt?'<div class="posted">✓ Posted '+fmtDate(p.postedAt)+'</div>':'')+'</article>';
-  }).join('')}
+  }
+  function section(title,items,empty){return '<section class="posts"><div class="meta" style="justify-content:space-between;margin:2px 0 4px"><span class="pill pill-source">'+title+'</span><span>'+items.length+' drafts</span></div>'+(items.length?items.map(card).join(''):'<div class="empty"><div class="empty-title">'+empty+'</div></div>')+'</section>'}
+  const topicPosts=posts.filter(p=>postSource(p)==='topic');
+  const trendingPosts=posts.filter(p=>postSource(p)==='trending');
+  root.innerHTML=section('Topic',topicPosts,'No topic drafts yet.')+section('Trending',trendingPosts,'No trending drafts yet.')}
 function metric(label,value){return '<div class="metric"><b>'+esc(value)+'</b><span>'+esc(label)+'</span></div>'}
 function renderProfile(){
   const root=$('profile');const s=profileSnapshots[0];
@@ -768,7 +773,7 @@ function renderProfile(){
   const p=s.profile||{};const m=p.metrics||{};
   root.innerHTML='<article class="profile-card"><div class="meta"><span class="pill">'+esc(s.handle||'authored')+'</span><span class="ts">'+fmtDate(s.createdAt)+'</span><span>'+esc(p.sampleCount||0)+' tweets</span></div>'+(s.note?'<div class="failed">'+esc(s.note)+'</div>':'')+'<div class="metric-grid">'+metric('median chars',m.medianChars||0)+metric('median lines',m.medianLines||0)+metric('short posts',String(m.shortPostPct||0)+'%')+metric('links',String(m.linkPct||0)+'%')+metric('questions',String(m.questionPct||0)+'%')+metric('hashtags',String(m.hashtagPct||0)+'%')+'</div><div><b>Style guidance</b><div class="trend-list">'+(p.guidance||[]).map(x=>'<span>'+esc(x)+'</span>').join('')+'</div></div><div><b>Common terms</b><div class="trend-list">'+(((p.terms||{}).terms||[]).slice(0,12).map(t=>'<span><b>'+esc(t.term)+'</b><em>'+t.count+'</em></span>').join('')||'<span>None yet</span>')+'</div></div><div><b>Repeated phrases</b><div class="trend-list">'+((p.phrases||[]).slice(0,12).map(t=>'<span><b>'+esc(t.phrase)+'</b><em>'+t.count+'</em></span>').join('')||'<span>None yet</span>')+'</div></div><div><b>Sample posts</b>'+((p.samples||[]).map(x=>'<div class="sample">'+esc(x.text)+'</div>').join('')||'<div class="sample">No samples.</div>')+'</div></article>'}
 async function load(){const d=await api('/api/posts');posts=d.posts;renderPosts();const p=await api('/api/profile');profileSnapshots=p.profileSnapshots;renderProfile()}
-const SIDE_PANELS=['compose-panel','newdraft-panel','research-panel','profile-panel'];
+const SIDE_PANELS=['profile-panel'];
 function showTab(name){
   document.querySelectorAll('.nav-tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));
   $('posts').style.display=name==='posts'?'grid':'none';
@@ -781,18 +786,8 @@ function showTab(name){
 document.querySelectorAll('.nav-tab').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
 $('refresh').onclick=()=>load().catch(e=>setStatus(e.message,'failed'));
 $('doctor').onclick=async()=>{try{setStatus('Checking Birdclaw...');const d=await api('/api/doctor');const b=d.birdclaw||{};const ok=b.installed&&b.authOk;setStatus([b.installed?'Birdclaw '+(b.version||'?')+' ✓':'Birdclaw ✗',b.authOk?'auth ok ✓':'auth ✗'].join('  ·  '),ok?'success':'failed')}catch(e){setStatus(e.message,'failed')}};
-$('scan').onclick=async()=>{try{setStatus('Analyzing...');const d=await api('/api/trends?topic='+encodeURIComponent($('topic').value));$('trends').innerHTML=(d.analysis.terms||[]).slice(0,10).map(t=>'<span><b>'+esc(t.term)+'</b><em>'+t.count+'</em></span>').join('')||'<span>No terms found.</span>';setStatus('Analyzed '+d.sampleCount+' tweets.','success')}catch(e){setStatus(e.message,'failed')}};
 $('learnProfile').onclick=async()=>{try{setStatus('Learning from authored tweets...');const d=await api('/api/profile/learn',{method:'POST',body:JSON.stringify({handle:$('handle').value,limit:200})});profileSnapshots=[d,...profileSnapshots];renderProfile();showTab('profile');setStatus('Profile snapshot saved: '+(d.profile.sampleCount||0)+' tweets.','success')}catch(e){setStatus(e.message,'failed')}};
-$('saveNew').onclick=async()=>{try{const text=$('newText').value.trim();if(!text)return setStatus('Draft text is required.','failed');await api('/api/posts',{method:'POST',body:JSON.stringify({text,topic:$('topic').value,angle:$('angle').value,source:'dashboard'})});$('newText').value='';$('angle').value='';await load();setStatus('Draft saved.','success')}catch(e){setStatus(e.message,'failed')}};
 $('posts').onclick=async ev=>{const b=ev.target.closest('button');if(!b)return;const c=ev.target.closest('.post');const id=c.dataset.id;const action=b.dataset.action;try{if(action==='save'){await api('/api/posts/'+id,{method:'PATCH',body:JSON.stringify({text:c.querySelector('[data-field="text"]').value})});setStatus('Saved.','success')}if(action==='rewrite'){await api('/api/posts/'+id+'/rewrite-request',{method:'POST',body:JSON.stringify({instruction:c.querySelector('[data-field="rewrite"]').value})});setStatus('Rewrite request saved.','success')}if(action==='post'){if(!pendingPost.has(id)){const orig=b.textContent;b.classList.add('danger-confirm');b.textContent='Click again to post';const t=setTimeout(()=>{if(pendingPost.get(id)===t){pendingPost.delete(id);b.classList.remove('danger-confirm');b.textContent=orig}},6000);pendingPost.set(id,t);setStatus('Confirm: click again within 6s to post.');return}clearTimeout(pendingPost.get(id));pendingPost.delete(id);b.classList.remove('danger-confirm');b.textContent='Posting...';b.disabled=true;await api('/api/posts/'+id+'/post',{method:'POST'});setStatus('Posted. Check card for result.','success')}await load()}catch(e){setStatus(e.message,'failed');b.disabled=false;b.textContent='Post to X';b.classList.remove('danger-confirm')}};
-async function loadStrategy(){const d=await api('/api/strategy');$('contentArea').value=(d.strategy&&d.strategy.contentArea)||''}
-async function saveArea(){const area=$('contentArea').value.trim();await api('/api/strategy',{method:'PATCH',body:JSON.stringify({contentArea:area})});setStatus('Posting area saved.','success')}
-async function scanArea(){const topic=($('topic').value||$('contentArea').value).trim();if(!topic)return setStatus('Enter a topic or posting area first.','failed');setStatus('Analyzing...');const d=await api('/api/trends?topic='+encodeURIComponent(topic));$('trends').innerHTML=(d.analysis.terms||[]).slice(0,10).map(t=>'<span><b>'+esc(t.term)+'</b><em>'+t.count+'</em></span>').join('')||'<span>No terms found.</span>';setStatus('Analyzed '+d.sampleCount+' tweets for '+topic+'.','success')}
-async function generateDrafts(){const area=$('contentArea').value.trim()||$('topic').value.trim();if(!area)return setStatus('Enter a posting area first.','failed');const btn=$('generateDrafts');const orig=btn.textContent;btn.disabled=true;btn.textContent='Generating...';setStatus('Analyzing trends and generating drafts...');try{const d=await api('/api/generate',{method:'POST',body:JSON.stringify({area,count:5,limit:40})});await load();showTab('posts');setStatus('Generated '+d.posts.length+' drafts for '+area+'.','success')}finally{btn.disabled=false;btn.textContent=orig}}
-if($('saveArea'))$('saveArea').onclick=()=>saveArea().catch(e=>setStatus(e.message,'failed'));
-if($('generateDrafts'))$('generateDrafts').onclick=()=>generateDrafts().catch(e=>setStatus(e.message,'failed'));
-$('scan').onclick=()=>scanArea().catch(e=>setStatus(e.message,'failed'));
-loadStrategy().catch(()=>{});
 load().catch(e=>setStatus(e.message,'failed'));
 
 /* ── GENERATE TAB: Source switching ── */
@@ -818,14 +813,14 @@ function renderFeedPosts(){
   }).join('')}
 $('fetchFeedBtn').onclick=async()=>{
   try{
-    setStatus('Fetching feed posts...');
+    setStatus('Fetching trending posts...');
     const topic=$('feedTopic').value.trim();
     const data=await api('/api/feed'+(topic?'?topic='+encodeURIComponent(topic):''));
     feedSnapshot=data;selectedFeedIds.clear();
     renderFeedPosts();
     $('feedGenerateSide').style.display='';
-    $('feedSideMeta').textContent=data.sampleCount+' posts fetched'+(topic?' for "'+topic+'"':' from home timeline');
-    setStatus('Fetched '+data.sampleCount+' posts.','success');
+    $('feedSideMeta').textContent=data.sampleCount+' trending posts fetched'+(topic?' for "'+topic+'"':' from home timeline');
+    setStatus('Fetched '+data.sampleCount+' trending posts.','success');
   }catch(e){setStatus(e.message,'failed')}};
 $('feed-posts-grid').addEventListener('click',ev=>{
   const card=ev.target.closest('.feed-post');if(!card)return;
@@ -834,17 +829,17 @@ $('feed-posts-grid').addEventListener('click',ev=>{
   renderFeedPosts()});
 $('genFromFeedBtn').onclick=async()=>{
   try{
-    const area=$('feedArea').value.trim()||$('contentArea').value.trim();
-    if(!area)return setStatus('Enter a posting area first.','failed');
-    if(!feedSnapshot)return setStatus('Fetch feed posts first.','failed');
+    const area=$('feedArea').value.trim()||$('feedTopic').value.trim();
+    if(!area)return setStatus('Enter your angle/topic for these trending posts first.','failed');
+    if(!feedSnapshot)return setStatus('Fetch trending posts first.','failed');
     const btn=$('genFromFeedBtn');const orig=btn.textContent;btn.disabled=true;btn.textContent='Generating...';
-    setStatus('Generating takes from selected posts...');
+    setStatus('Generating your versions of selected trending posts...');
     const selIds=selectedFeedIds.size>0?[...selectedFeedIds]:[];
     const data=await api('/api/generate/feed',{method:'POST',body:JSON.stringify({area,feedSnapshotId:feedSnapshot.id,selectedPostIds:selIds,count:Math.max(selIds.length||5,1)})});
     await load();showTab('posts');
-    setStatus('Generated '+data.posts.length+' drafts from feed.','success');
+    setStatus('Generated '+data.posts.length+' trending drafts.','success');
     btn.disabled=false;btn.textContent=orig;
-  }catch(e){setStatus(e.message,'failed');$('genFromFeedBtn').disabled=false;$('genFromFeedBtn').textContent='Generate my takes'}};
+  }catch(e){setStatus(e.message,'failed');$('genFromFeedBtn').disabled=false;$('genFromFeedBtn').textContent='Generate my versions'}};
 
 /* ── DIRECTION SOURCE ── */
 async function loadDirections(){
@@ -857,7 +852,7 @@ function renderDirList(){
 function updateDirSideMeta(){
   const meta=$('dirSideMeta');const genSide=$('dirGenerateSide');
   if(activeDirId){const dir=directions.find(d=>d.id===activeDirId);meta.textContent=dir?'Active: '+dir.name:'';genSide.style.display=''}
-  else{meta.textContent='Select a direction from the list to generate.';genSide.style.display='none'}}
+  else{meta.textContent='Select a topic from the list to generate.';genSide.style.display='none'}}
 $('dir-grid').addEventListener('click',ev=>{
   const card=ev.target.closest('.dir-card');if(!card)return;
   const did=card.dataset.did;
@@ -866,7 +861,7 @@ $('dir-grid').addEventListener('click',ev=>{
 function showDirEditor(id){
   const dir=id?directions.find(d=>d.id===id):null;
   editingDirId=id||null;
-  $('dirEditLabel').textContent=dir?'Editing: '+dir.name:'New direction';
+  $('dirEditLabel').textContent=dir?'Editing: '+dir.name:'New topic';
   $('dirName').value=dir?dir.name:'';
   $('dirDesc').value=dir?(dir.description||''):'';
   $('dirRefs').value=dir?(dir.references||[]).join('\n---\n'):'';
@@ -877,7 +872,7 @@ $('newDirBtn').onclick=()=>{editingDirId=null;activeDirId=null;showDirEditor(nul
 $('cancelDirBtn').onclick=()=>{$('dir-editor-card').style.display='none';editingDirId=null};
 $('saveDirBtn').onclick=async()=>{
   try{
-    const name=$('dirName').value.trim();if(!name)return setStatus('Direction name is required.','failed');
+    const name=$('dirName').value.trim();if(!name)return setStatus('Topic name is required.','failed');
     const description=$('dirDesc').value.trim();
     const refsRaw=$('dirRefs').value.trim();
     const references=refsRaw?refsRaw.split(/\n---\n/).map(r=>r.trim()).filter(Boolean):[];
@@ -886,7 +881,7 @@ $('saveDirBtn').onclick=async()=>{
     if(editingDirId){dir=await api('/api/directions/'+editingDirId,{method:'PATCH',body:JSON.stringify({name,description,references,useTweetSamples})})}
     else{dir=await api('/api/directions',{method:'POST',body:JSON.stringify({name,description,references,useTweetSamples})})}
     activeDirId=dir.id;await loadDirections();$('dir-editor-card').style.display='none';editingDirId=null;
-    setStatus('Direction saved: '+dir.name,'success');
+    setStatus('Topic saved: '+dir.name,'success');
   }catch(e){setStatus(e.message,'failed')}};
 $('deleteDirBtn').onclick=async()=>{
   if(!editingDirId)return;
@@ -894,18 +889,18 @@ $('deleteDirBtn').onclick=async()=>{
     await api('/api/directions/'+editingDirId,{method:'DELETE'});
     if(activeDirId===editingDirId)activeDirId=null;
     editingDirId=null;$('dir-editor-card').style.display='none';
-    await loadDirections();setStatus('Direction deleted.','success');
+    await loadDirections();setStatus('Topic deleted.','success');
   }catch(e){setStatus(e.message,'failed')}};
 $('genFromDirBtn').onclick=async()=>{
-  if(!activeDirId)return setStatus('Select a direction first.','failed');
+  if(!activeDirId)return setStatus('Select a topic first.','failed');
   try{
     const btn=$('genFromDirBtn');const orig=btn.textContent;btn.disabled=true;btn.textContent='Generating...';
-    setStatus('Generating deep dive from direction...');
+    setStatus('Generating posts for selected topic...');
     const data=await api('/api/generate/direction',{method:'POST',body:JSON.stringify({directionId:activeDirId,count:5})});
     await load();showTab('posts');
-    setStatus('Generated '+data.posts.length+' drafts from direction.','success');
+    setStatus('Generated '+data.posts.length+' topic drafts.','success');
     btn.disabled=false;btn.textContent=orig;
-  }catch(e){setStatus(e.message,'failed');$('genFromDirBtn').disabled=false;$('genFromDirBtn').textContent='Generate deep dive'}};`;
+  }catch(e){setStatus(e.message,'failed');$('genFromDirBtn').disabled=false;$('genFromDirBtn').textContent='Generate topic posts'}};`;
 
   return [
     "<!doctype html>",
