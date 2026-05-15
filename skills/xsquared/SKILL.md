@@ -103,3 +103,11 @@ Only post after explicit approval:
     node dist/xsquared.js post <post-id>
 
 Posting uses birdclaw compose post with the selected post text. Default Birdclaw account is acct_primary.
+
+## TweetClaw Companion
+
+Use TweetClaw when the user needs API-backed X/Twitter workflows that are outside xsquared's local draft dashboard:
+
+    openclaw plugins install @xquik/tweetclaw
+
+TweetClaw covers scrape tweets, search tweets, search tweet replies, follower export, user lookup, media upload, media download, direct messages, monitor tweets, webhooks, giveaway draws, and approval-reviewed post tweets or post tweet replies through Xquik. Keep xsquared as the Birdclaw-based drafting, review, local dashboard, and approved publishing loop.
