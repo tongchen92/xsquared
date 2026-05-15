@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Block skill usage when gstack is not installed globally.
 
 if [ ! -d "$HOME/.claude/skills/gstack/bin" ]; then
@@ -17,4 +17,4 @@ MSG
   exit 0
 fi
 
-echo '{}'
+echo '{"permissionDecision":"allow"}'
