@@ -32,7 +32,7 @@ CLI:
     node dist/xsquared.js strategy-set --area "Google Ads for small business"
     node dist/xsquared.js trends --topic "AI agents" --limit 40
     node dist/xsquared.js generate --area "Google Ads for small business" --count 5
-    node dist/xsquared.js profile-learn --handle "@tongchen92" --limit 200
+    node dist/xsquared.js profile-learn --handle "@therealtongchen" --limit 200
     node dist/xsquared.js profile --json
     node dist/xsquared.js save --topic "AI agents" --angle "operator leverage" --text "..."
     node dist/xsquared.js list
@@ -53,7 +53,7 @@ The automatic content loop is intentionally simple for the first version:
 3. xsquared combines the selected source with the latest writing-profile snapshot.
 4. It saves draft posts locally for review and rewrite.
 
-Profile learning uses Birdclaw's local authored-tweet store. If the Profile tab shows zero tweets, import your X archive into Birdclaw or run Birdclaw authored sync first, then click Learn Profile again.
+Profile learning runs automatically when the dashboard loads profile data. xsquared first checks Birdclaw's local authored-tweet store, then falls back to Bird's profile timeline fetch for `@therealtongchen` when local authored tweets are empty.
 
 Privacy: xsquared stores generated content locally in .xsquared/store.json by default. It does not send data to X unless a post action is explicitly triggered.
 

@@ -50,11 +50,11 @@ For example: Google Ads for small business.
 
     node dist/xsquared.js trends --topic "<topic>" --limit 40 --json
 
-5. Learn the user's writing style when authored tweets are available in Birdclaw:
+5. Learn the user's writing style. The dashboard does this automatically; run manually only when you need to force-refresh:
 
-    node dist/xsquared.js profile-learn --handle "@<handle>" --limit 200 --json
+    node dist/xsquared.js profile-learn --handle "@therealtongchen" --limit 200 --json
 
-If this returns zero tweets, tell the user Birdclaw needs an X archive import or authored sync before xsquared can learn from their history.
+xsquared first checks Birdclaw's local authored-tweet store, then falls back to Bird's profile timeline fetch when authored tweets are empty.
 
 6. Generate 3-8 strong X post candidates:
 

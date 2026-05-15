@@ -14,6 +14,9 @@ const APP_DIR = process.env.XSQUARED_HOME || path.join(PLUGIN_ROOT, ".xsquared")
 const STORE_PATH = path.join(APP_DIR, "store.json");
 const LOCAL_BIRDCLAW_BIN = path.join(PLUGIN_ROOT, "node_modules", ".bin", process.platform === "win32" ? "birdclaw.cmd" : "birdclaw");
 const LOCAL_BIRDCLAW_SCRIPT = path.join(PLUGIN_ROOT, "node_modules", "birdclaw", "bin", "birdclaw.mjs");
+const DEFAULT_PROFILE_HANDLE = process.env.XSQUARED_HANDLE || "@therealtongchen";
+const DEFAULT_PROFILE_LIMIT = process.env.XSQUARED_PROFILE_LIMIT || "200";
+const PROFILE_REFRESH_MS = Number(process.env.XSQUARED_PROFILE_REFRESH_MS || String(12 * 60 * 60 * 1000));
 const BIRDCLAW_CANDIDATES = process.env.BIRDCLAW_BIN
   ? [process.env.BIRDCLAW_BIN]
   : [LOCAL_BIRDCLAW_BIN, LOCAL_BIRDCLAW_SCRIPT, "birdclaw"].filter(function(candidate, index, arr) {
@@ -105,6 +108,20 @@ function parseJsonLinesOrArray(text) {
     if (Array.isArray(parsed.results)) return parsed.results;
     return [parsed];
   } catch {
+    const objectStart = trimmed.indexOf("{");
+    const arrayStart = trimmed.indexOf("[");
+    const starts = [objectStart, arrayStart].filter(function(index) { return index >= 0; });
+    if (starts.length) {
+      const jsonStart = Math.min(...starts);
+      try {
+        const parsed = JSON.parse(trimmed.slice(jsonStart));
+        if (Array.isArray(parsed)) return parsed;
+        if (Array.isArray(parsed.tweets)) return parsed.tweets;
+        if (Array.isArray(parsed.items)) return parsed.items;
+        if (Array.isArray(parsed.results)) return parsed.results;
+        return [parsed];
+      } catch {}
+    }
     return trimmed.split("\n").map(function(line) {
       return line.trim();
     }).filter(Boolean).map(function(line) {
@@ -115,6 +132,13 @@ function parseJsonLinesOrArray(text) {
       }
     });
   }
+}
+
+function birdUserTweets(handle, limit) {
+  if (!handle) return null;
+  const safeLimit = Math.min(200, Math.max(1, Number(limit || 100)));
+  const pageCount = Math.min(10, Math.max(1, Math.ceil(safeLimit / 100)));
+  return run("bird", ["user-tweets", handle, "-n", String(safeLimit), "--max-pages", String(pageCount), "--json"]);
 }
 
 function tweetText(item) {
@@ -294,18 +318,31 @@ function analyzeWritingProfile(tweets, handle) {
 }
 
 function learnProfile(opts) {
-  const handle = opts.values.handle || process.env.XSQUARED_HANDLE || "";
-  const limit = opts.values.limit || "200";
+  const handle = opts.values.handle || DEFAULT_PROFILE_HANDLE;
+  const limit = opts.values.limit || DEFAULT_PROFILE_LIMIT;
   const args = ["--json", "search", "tweets", "--resource", "authored", "--limit", String(limit)];
   if (opts.values.query) args.push(opts.values.query);
   const result = birdclaw(args);
   let tweets = extractTweets(result);
+  let profileSource = "birdclaw-authored";
   if (handle) {
     const normalized = handle.replace(/^@/, "").toLowerCase();
     const authored = tweets.filter(function(tweet) {
       return String(tweet.author || "").replace(/^@/, "").toLowerCase() === normalized;
     });
     if (authored.length) tweets = authored;
+    if (!tweets.length) {
+      const birdResult = birdUserTweets(handle, limit);
+      if (birdResult && birdResult.ok) {
+        const birdTweets = extractTweets(birdResult).filter(function(tweet) {
+          return !/^RT\s+@/i.test(tweet.text);
+        });
+        if (birdTweets.length) {
+          tweets = birdTweets;
+          profileSource = "bird-user-tweets";
+        }
+      }
+    }
   }
   const profile = analyzeWritingProfile(tweets, handle);
   const snapshot = {
@@ -313,7 +350,7 @@ function learnProfile(opts) {
     createdAt: nowIso(),
     handle: handle || null,
     limit: Number(limit),
-    birdclaw: { ok: result.ok, status: result.status, error: result.error, stderr: result.stderr.trim() },
+    birdclaw: { ok: result.ok, status: result.status, error: result.error, stderr: result.stderr.trim(), source: profileSource },
     profile,
     note: profile.sampleCount ? "" : "No authored tweets found in Birdclaw local data. Import your X archive or run Birdclaw authored sync, then learn again."
   };
@@ -322,6 +359,26 @@ function learnProfile(opts) {
   store.profileSnapshots = store.profileSnapshots.slice(0, 25);
   writeStore(store);
   return snapshot;
+}
+
+function profileSnapshotIsFresh(snapshot) {
+  if (!snapshot || !snapshot.createdAt) return false;
+  if (String(snapshot.handle || "") !== DEFAULT_PROFILE_HANDLE) return false;
+  if (!snapshot.profile || !snapshot.profile.sampleCount) return false;
+  return Date.now() - new Date(snapshot.createdAt).getTime() < PROFILE_REFRESH_MS;
+}
+
+function getProfileSnapshotsWithAutoLearn(force = false) {
+  const store = readStore();
+  const latest = store.profileSnapshots[0] || null;
+  if (force || !profileSnapshotIsFresh(latest)) {
+    try {
+      learnProfile({ values: { handle: DEFAULT_PROFILE_HANDLE, limit: DEFAULT_PROFILE_LIMIT } });
+    } catch {
+      // Profile learning should not make the dashboard unusable.
+    }
+  }
+  return readStore().profileSnapshots;
 }
 
 function setStrategy(input) {
@@ -737,7 +794,7 @@ function html() {
 
   const HEADER = "<header><div class=\"bar\"><div class=\"brand\"><h1><span class=\"brand-mark\">x</span>squared</h1><span class=\"brand-tag\">drafts</span></div><nav class=\"nav-tabs\" aria-label=\"Primary\"><button class=\"nav-tab active\" data-tab=\"posts\">Posts</button><button class=\"nav-tab\" data-tab=\"generate\">Generate</button><button class=\"nav-tab\" data-tab=\"profile\">Profile</button></nav><div class=\"tools\"><button id=\"doctor\" class=\"ghost\">Doctor</button><button id=\"refresh\" class=\"ghost\">Refresh</button></div></div></header>";
 
-  const SIDEBAR_POSTS = "<section class=\"panel\" id=\"profile-panel\"><h2 class=\"panel-head\">Profile learning</h2><div class=\"field\"><label>X handle</label><input id=\"handle\" placeholder=\"@tongchen92\"></div><div class=\"row\"><button id=\"learnProfile\">Learn profile</button></div></section>";
+  const SIDEBAR_POSTS = "";
 
   const SIDEBAR_GEN = "<div id=\"gen-side\" style=\"display:none\"><section class=\"panel\"><h2 class=\"panel-head\">Source</h2><div class=\"source-tabs\"><button class=\"source-tab active\" data-source=\"direction\">Topic</button><button class=\"source-tab\" data-source=\"feed\">Trending</button></div><div id=\"direction-side\"><button id=\"newDirBtn\" class=\"primary\" style=\"width:100%;margin-bottom:10px\">+ New topic</button><div id=\"dirSideMeta\" style=\"font-size:12px;color:var(--muted);margin-bottom:8px\">Select a topic to generate from it.</div><div id=\"dirGenerateSide\" style=\"display:none\"><button id=\"genFromDirBtn\" class=\"accent\" style=\"width:100%\">Generate topic posts</button></div></div><div id=\"feed-side\" style=\"display:none\"><div class=\"field\"><label>Trending filter</label><input id=\"feedTopic\" placeholder=\"Optional: Google Ads, AI agents...\"></div><div class=\"row\" style=\"margin-bottom:12px\"><button id=\"fetchFeedBtn\" class=\"primary\">Fetch trending posts</button></div><div id=\"feedSideMeta\" style=\"font-size:12px;color:var(--muted)\"></div><div id=\"feedGenerateSide\" style=\"display:none;margin-top:12px\"><div class=\"field\"><label>Your angle / topic</label><input id=\"feedArea\" placeholder=\"Google Ads for small business\"></div><button id=\"genFromFeedBtn\" class=\"accent\" style=\"width:100%\">Generate my versions</button></div></div></section></div>";
 
@@ -769,11 +826,11 @@ function renderPosts(){
 function metric(label,value){return '<div class="metric"><b>'+esc(value)+'</b><span>'+esc(label)+'</span></div>'}
 function renderProfile(){
   const root=$('profile');const s=profileSnapshots[0];
-  if(!s){root.innerHTML='<div class="empty"><div class="empty-title">No profile snapshot yet.</div><div class="empty-body">Enter your X handle under <b>Profile learning</b> and click <b>Learn profile</b>.</div></div>';return}
+  if(!s){root.innerHTML='<div class="empty"><div class="empty-title">No profile snapshot yet.</div><div class="empty-body">xsquared learns your profile automatically from Birdclaw when this tab loads.</div></div>';return}
   const p=s.profile||{};const m=p.metrics||{};
   root.innerHTML='<article class="profile-card"><div class="meta"><span class="pill">'+esc(s.handle||'authored')+'</span><span class="ts">'+fmtDate(s.createdAt)+'</span><span>'+esc(p.sampleCount||0)+' tweets</span></div>'+(s.note?'<div class="failed">'+esc(s.note)+'</div>':'')+'<div class="metric-grid">'+metric('median chars',m.medianChars||0)+metric('median lines',m.medianLines||0)+metric('short posts',String(m.shortPostPct||0)+'%')+metric('links',String(m.linkPct||0)+'%')+metric('questions',String(m.questionPct||0)+'%')+metric('hashtags',String(m.hashtagPct||0)+'%')+'</div><div><b>Style guidance</b><div class="trend-list">'+(p.guidance||[]).map(x=>'<span>'+esc(x)+'</span>').join('')+'</div></div><div><b>Common terms</b><div class="trend-list">'+(((p.terms||{}).terms||[]).slice(0,12).map(t=>'<span><b>'+esc(t.term)+'</b><em>'+t.count+'</em></span>').join('')||'<span>None yet</span>')+'</div></div><div><b>Repeated phrases</b><div class="trend-list">'+((p.phrases||[]).slice(0,12).map(t=>'<span><b>'+esc(t.phrase)+'</b><em>'+t.count+'</em></span>').join('')||'<span>None yet</span>')+'</div></div><div><b>Sample posts</b>'+((p.samples||[]).map(x=>'<div class="sample">'+esc(x.text)+'</div>').join('')||'<div class="sample">No samples.</div>')+'</div></article>'}
 async function load(){const d=await api('/api/posts');posts=d.posts;renderPosts();const p=await api('/api/profile');profileSnapshots=p.profileSnapshots;renderProfile()}
-const SIDE_PANELS=['profile-panel'];
+const SIDE_PANELS=[];
 function showTab(name){
   document.querySelectorAll('.nav-tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));
   $('posts').style.display=name==='posts'?'grid':'none';
@@ -786,7 +843,6 @@ function showTab(name){
 document.querySelectorAll('.nav-tab').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
 $('refresh').onclick=()=>load().catch(e=>setStatus(e.message,'failed'));
 $('doctor').onclick=async()=>{try{setStatus('Checking Birdclaw...');const d=await api('/api/doctor');const b=d.birdclaw||{};const ok=b.installed&&b.authOk;setStatus([b.installed?'Birdclaw '+(b.version||'?')+' ✓':'Birdclaw ✗',b.authOk?'auth ok ✓':'auth ✗'].join('  ·  '),ok?'success':'failed')}catch(e){setStatus(e.message,'failed')}};
-$('learnProfile').onclick=async()=>{try{setStatus('Learning from authored tweets...');const d=await api('/api/profile/learn',{method:'POST',body:JSON.stringify({handle:$('handle').value,limit:200})});profileSnapshots=[d,...profileSnapshots];renderProfile();showTab('profile');setStatus('Profile snapshot saved: '+(d.profile.sampleCount||0)+' tweets.','success')}catch(e){setStatus(e.message,'failed')}};
 $('posts').onclick=async ev=>{const b=ev.target.closest('button');if(!b)return;const c=ev.target.closest('.post');const id=c.dataset.id;const action=b.dataset.action;try{if(action==='save'){await api('/api/posts/'+id,{method:'PATCH',body:JSON.stringify({text:c.querySelector('[data-field="text"]').value})});setStatus('Saved.','success')}if(action==='rewrite'){await api('/api/posts/'+id+'/rewrite-request',{method:'POST',body:JSON.stringify({instruction:c.querySelector('[data-field="rewrite"]').value})});setStatus('Rewrite request saved.','success')}if(action==='post'){if(!pendingPost.has(id)){const orig=b.textContent;b.classList.add('danger-confirm');b.textContent='Click again to post';const t=setTimeout(()=>{if(pendingPost.get(id)===t){pendingPost.delete(id);b.classList.remove('danger-confirm');b.textContent=orig}},6000);pendingPost.set(id,t);setStatus('Confirm: click again within 6s to post.');return}clearTimeout(pendingPost.get(id));pendingPost.delete(id);b.classList.remove('danger-confirm');b.textContent='Posting...';b.disabled=true;await api('/api/posts/'+id+'/post',{method:'POST'});setStatus('Posted. Check card for result.','success')}await load()}catch(e){setStatus(e.message,'failed');b.disabled=false;b.textContent='Post to X';b.classList.remove('danger-confirm')}};
 load().catch(e=>setStatus(e.message,'failed'));
 
@@ -954,7 +1010,7 @@ function startDashboard(port, host) {
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/profile") {
-        sendJson(res, 200, { profileSnapshots: readStore().profileSnapshots });
+        sendJson(res, 200, { profileSnapshots: getProfileSnapshotsWithAutoLearn(url.searchParams.get("refresh") === "1") });
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/profile/learn") {
