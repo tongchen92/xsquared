@@ -1,0 +1,35 @@
+{
+  "name": "xsquared",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin for drafting, reviewing, and publishing high-quality X posts with Birdclaw.",
+  "author": {
+    "name": "Tong Chen",
+    "email": "tongchen92@gmail.com",
+    "url": "https://github.com/tongchen92"
+  },
+  "homepage": "https://github.com/tongchen92/xsquared",
+  "repository": "https://github.com/tongchen92/xsquared",
+  "license": "MIT",
+  "keywords": ["openclaw", "codex-plugin", "x", "twitter", "birdclaw", "content"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "xsquared",
+    "shortDescription": "Generate and publish X content from trends and topics.",
+    "longDescription": "xsquared gives OpenClaw a repeatable workflow for analyzing X context with Birdclaw, generating post candidates, tracking drafts in a local dashboard, rewriting drafts on request, and publishing approved posts through Birdclaw.",
+    "developerName": "Tong Chen",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write", "Local dashboard", "Social publishing"],
+    "websiteURL": "https://github.com/tongchen92/xsquared",
+    "privacyPolicyURL": "https://github.com/tongchen92/xsquared#privacy",
+    "termsOfServiceURL": "https://github.com/tongchen92/xsquared#terms",
+    "defaultPrompt": [
+      "Generate X posts about AI agents.",
+      "Rewrite my latest xsquared draft.",
+      "Open the xsquared dashboard."
+    ],
+    "brandColor": "#111827",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/icon.svg",
+    "screenshots": []
+  }
+}
