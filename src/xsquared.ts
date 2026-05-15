@@ -864,7 +864,7 @@ function showDirEditor(id){
   $('dirEditLabel').textContent=dir?'Editing: '+dir.name:'New topic';
   $('dirName').value=dir?dir.name:'';
   $('dirDesc').value=dir?(dir.description||''):'';
-  $('dirRefs').value=dir?(dir.references||[]).join('\n---\n'):'';
+  $('dirRefs').value=dir?(dir.references||[]).join('\\n---\\n'):'';
   $('dirUseTweets').checked=dir?Boolean(dir.useTweetSamples):false;
   $('deleteDirBtn').style.display=dir?'':'none';
   $('dir-editor-card').style.display=''}
@@ -875,7 +875,7 @@ $('saveDirBtn').onclick=async()=>{
     const name=$('dirName').value.trim();if(!name)return setStatus('Topic name is required.','failed');
     const description=$('dirDesc').value.trim();
     const refsRaw=$('dirRefs').value.trim();
-    const references=refsRaw?refsRaw.split(/\n---\n/).map(r=>r.trim()).filter(Boolean):[];
+    const references=refsRaw?refsRaw.split(/\\n---\\n/).map(r=>r.trim()).filter(Boolean):[];
     const useTweetSamples=$('dirUseTweets').checked;
     let dir;
     if(editingDirId){dir=await api('/api/directions/'+editingDirId,{method:'PATCH',body:JSON.stringify({name,description,references,useTweetSamples})})}
