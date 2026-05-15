@@ -516,7 +516,7 @@ function saveDirection(input) {
     name: String(input.name).trim(),
     description: String(input.description || "").trim(),
     references: Array.isArray(input.references) ? input.references.filter(Boolean) : (input.references ? [String(input.references)] : []),
-    useTweetSamples: Boolean(input.useTweetSamples)
+    useTweetSamples: input.useTweetSamples !== false
   };
   store.directions.unshift(direction);
   writeStore(store);
@@ -593,11 +593,14 @@ function makeFeedInspiredTexts(selectedPosts, area, profileSnapshot, count) {
 function makeDirectionTexts(direction, profileSnapshot, count) {
   const profile = profileSnapshot ? (profileSnapshot.profile || {}) : {};
   const compact = !profile.metrics || !profile.metrics.medianChars || profile.metrics.medianChars < 180;
+  const useTweetVoice = direction.useTweetSamples !== false;
   const name = direction.name || "this topic";
   const description = String(direction.description || "");
   const refs = (direction.references || []).join(" ");
   const refTerms = refs ? analyzeTerms([refs], name).terms.slice(0, 6).map(function(t) { return t.term; }) : [];
+  const sampleTerms = useTweetVoice && profile.terms && profile.terms.terms ? profile.terms.terms.slice(0, 3).map(function(t) { return t.term; }) : [];
   const termLine = refTerms.length ? " Key context: " + refTerms.slice(0, 3).join(", ") + "." : "";
+  const voiceLine = sampleTerms.length ? " Voice context: " + sampleTerms.join(", ") + "." : "";
   const angles = ["core claim", "contrarian angle", "implementation", "common mistake", "first principle", "specific insight"];
   const drafts = [
     "On " + name + ": " + (description || "the depth is in the specifics, not the framework.") + termLine,
@@ -607,7 +610,7 @@ function makeDirectionTexts(direction, profileSnapshot, count) {
     "The diagnostic step on " + name + " most teams skip: understand what is actually broken before optimizing anything.",
     "The specific thing about " + name + " nobody talks about: " + (refTerms.length ? refTerms[0] + " as a leading signal, not a lagging one." : "the feedback loop is slower than it looks.")
   ];
-  if (direction.useTweetSamples && profileSnapshot && (profileSnapshot.profile.samples || []).length) {
+  if (useTweetVoice && profileSnapshot && (profileSnapshot.profile.samples || []).length) {
     drafts.push("Something I keep returning to on " + name + ": " + (description ? description.slice(0, 80) : "the distance between knowing and doing is where most effort gets lost."));
   }
   return drafts.slice(0, Number(count) || 5).map(function(text, index) {
@@ -617,7 +620,7 @@ function makeDirectionTexts(direction, profileSnapshot, count) {
       angle: angles[index % angles.length],
       score: Math.max(72, 88 - index * 2),
       text: trimmed,
-      notes: "Topic: " + name + (description ? " — " + description.slice(0, 100) : "") + (refTerms.length ? ". Key terms: " + refTerms.join(", ") : "") + ".",
+      notes: "Topic: " + name + (description ? " — " + description.slice(0, 100) : "") + (refTerms.length ? ". Key terms: " + refTerms.join(", ") : "") + (useTweetVoice ? voiceLine : "") + ".",
       source: "xsquared-generator",
       generationSource: "topic",
       inspirationPosts: [],
@@ -800,7 +803,7 @@ function html() {
 
   const SIDEBAR_SYS = "<section class=\"panel\"><h2 class=\"panel-head\">System</h2><div id=\"status\" class=\"status-bar\">Ready.</div></section>";
 
-  const CONTENT_GEN = "<div id=\"generate\" style=\"display:none\"><div id=\"gen-dir-view\"><div id=\"dir-editor-card\" class=\"post\" style=\"display:none;margin-bottom:14px\"><div class=\"meta\"><span id=\"dirEditLabel\" class=\"pill\">New topic</span></div><div class=\"field\"><label>Topic name</label><input id=\"dirName\" placeholder=\"Google Ads for small business\"></div><div class=\"field\"><label>Angle / objective</label><textarea id=\"dirDesc\" style=\"min-height:80px\" placeholder=\"What specific angle or claim do you want posts about?\"></textarea></div><div class=\"field\"><label>Reference material</label><textarea id=\"dirRefs\" style=\"min-height:180px\" placeholder=\"Paste notes, research, examples, constraints... Separate multiple references with a line containing only ---\"></textarea></div><div class=\"field\"><label style=\"display:flex;align-items:center;gap:8px;cursor:pointer\"><input type=\"checkbox\" id=\"dirUseTweets\" style=\"width:auto\"> Use my tweet samples for voice context</label></div><div class=\"row\"><button id=\"saveDirBtn\" class=\"primary\">Save topic</button><button id=\"cancelDirBtn\" class=\"ghost\">Cancel</button><button id=\"deleteDirBtn\" class=\"danger-confirm\" style=\"display:none\">Delete</button></div></div><div id=\"dir-grid\" class=\"dir-grid\"></div><div id=\"dir-empty\" class=\"empty\" style=\"display:none\"><div class=\"empty-title\">No topics yet.</div><div class=\"empty-body\">Click <b>+ New topic</b> to define one or many areas you want to post about, then generate drafts for the selected topic.</div></div></div><div id=\"gen-feed-view\" style=\"display:none\"><div id=\"feed-sel-bar\" class=\"sel-bar\" style=\"display:none\"><span class=\"sel-count\" id=\"feedSelCount\">0 selected</span><span style=\"font-size:12px;color:var(--muted)\">Click viral/relevant posts to select · drafts go to Posts tab</span></div><div id=\"feed-posts-grid\" class=\"feed-grid\"></div><div id=\"feed-empty\" class=\"empty\"><div class=\"empty-title\">No trending posts yet.</div><div class=\"empty-body\">Fetch viral or relevant feed posts, select the ones worth recreating, then generate your versions.</div></div></div></div>";
+  const CONTENT_GEN = "<div id=\"generate\" style=\"display:none\"><div id=\"gen-dir-view\"><div id=\"dir-editor-card\" class=\"post\" style=\"display:none;margin-bottom:14px\"><div class=\"meta\"><span id=\"dirEditLabel\" class=\"pill\">New topic</span></div><div class=\"field\"><label>Topic name</label><input id=\"dirName\" placeholder=\"Google Ads for small business\"></div><div class=\"field\"><label>Angle / objective</label><textarea id=\"dirDesc\" style=\"min-height:80px\" placeholder=\"What specific angle or claim do you want posts about?\"></textarea></div><div class=\"field\"><label>Reference material</label><textarea id=\"dirRefs\" style=\"min-height:180px\" placeholder=\"Paste notes, research, examples, constraints... Separate multiple references with a line containing only ---\"></textarea></div><div class=\"field\"><label style=\"display:flex;align-items:center;gap:8px;cursor:pointer\"><input type=\"checkbox\" id=\"dirUseTweets\" style=\"width:auto\"> Use learned tweet samples for voice</label></div><div class=\"row\"><button id=\"saveDirBtn\" class=\"primary\">Save topic</button><button id=\"cancelDirBtn\" class=\"ghost\">Cancel</button><button id=\"deleteDirBtn\" class=\"danger-confirm\" style=\"display:none\">Delete</button></div></div><div id=\"dir-grid\" class=\"dir-grid\"></div><div id=\"dir-empty\" class=\"empty\" style=\"display:none\"><div class=\"empty-title\">No topics yet.</div><div class=\"empty-body\">Click <b>+ New topic</b> to define one or many areas you want to post about, then generate drafts for the selected topic.</div></div></div><div id=\"gen-feed-view\" style=\"display:none\"><div id=\"feed-sel-bar\" class=\"sel-bar\" style=\"display:none\"><span class=\"sel-count\" id=\"feedSelCount\">0 selected</span><span style=\"font-size:12px;color:var(--muted)\">Click viral/relevant posts to select · drafts go to Posts tab</span></div><div id=\"feed-posts-grid\" class=\"feed-grid\"></div><div id=\"feed-empty\" class=\"empty\"><div class=\"empty-title\">No trending posts yet.</div><div class=\"empty-body\">Fetch viral or relevant feed posts, select the ones worth recreating, then generate your versions.</div></div></div></div>";
 
   const JS = `const $=id=>document.getElementById(id);
 let posts=[],profileSnapshots=[],feedSnapshot=null,selectedFeedIds=new Set(),directions=[],activeDirId=null,editingDirId=null;
@@ -912,7 +915,7 @@ function renderDirList(){
   const grid=$('dir-grid');const empty=$('dir-empty');
   if(!directions.length){grid.innerHTML='';empty.style.display='';return}
   empty.style.display='none';
-  grid.innerHTML=directions.map(d=>'<div class="dir-card'+(d.id===activeDirId?' active-dir':'')+'" data-did="'+esc(d.id)+'"><div class="dir-name">'+esc(d.name)+'</div>'+(d.description?'<div class="dir-desc">'+esc(d.description)+'</div>':'')+'<div class="dir-meta-row">'+(d.references&&d.references.length?d.references.length+' reference'+(d.references.length>1?'s':''):''+(d.useTweetSamples?' · uses tweet samples':''))+'</div></div>').join('')}
+  grid.innerHTML=directions.map(d=>{const meta=[];if(d.references&&d.references.length)meta.push(d.references.length+' reference'+(d.references.length>1?'s':''));if(d.useTweetSamples!==false)meta.push('uses tweet samples');return '<div class="dir-card'+(d.id===activeDirId?' active-dir':'')+'" data-did="'+esc(d.id)+'"><div class="dir-name">'+esc(d.name)+'</div>'+(d.description?'<div class="dir-desc">'+esc(d.description)+'</div>':'')+'<div class="dir-meta-row">'+meta.join(' · ')+'</div></div>'}).join('')}
 function updateDirSideMeta(){
   const meta=$('dirSideMeta');const genSide=$('dirGenerateSide');
   if(activeDirId){const dir=directions.find(d=>d.id===activeDirId);meta.textContent=dir?'Active: '+dir.name:'';genSide.style.display=''}
@@ -929,7 +932,7 @@ function showDirEditor(id){
   $('dirName').value=dir?dir.name:'';
   $('dirDesc').value=dir?(dir.description||''):'';
   $('dirRefs').value=dir?(dir.references||[]).join('\\n---\\n'):'';
-  $('dirUseTweets').checked=dir?Boolean(dir.useTweetSamples):false;
+  $('dirUseTweets').checked=dir?dir.useTweetSamples!==false:true;
   $('deleteDirBtn').style.display=dir?'':'none';
   $('dir-editor-card').style.display=''}
 $('newDirBtn').onclick=()=>{editingDirId=null;activeDirId=null;showDirEditor(null);renderDirList();updateDirSideMeta()};

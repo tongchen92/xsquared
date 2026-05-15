@@ -46,6 +46,8 @@ Generated drafts, topics, feed/source snapshots, rewrite requests, and learned p
 - Topic: the user defines one or many topics and reviews drafts created for that topic.
 - Trending: xsquared pulls viral/relevant feed posts and creates the user's version of selected posts.
 
+Topic sources use learned tweet samples for voice by default. Only turn that off when the user explicitly wants generic or off-profile drafts.
+
 3. Save or inspect the user's posting area when they provide one:
 
     npm run build

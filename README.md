@@ -55,6 +55,7 @@ The automatic content loop is intentionally simple for the first version:
 1. Use Topic when you already know what you want to post about, such as "Google Ads for small business".
 2. Use Trending when you want xsquared to pull relevant feed posts and help recreate your version of what is working.
 3. xsquared combines the selected source with the latest writing-profile snapshot.
+   Topic generation uses learned tweet samples for voice by default unless that source is explicitly turned off.
 4. It saves draft posts locally for review and rewrite.
 
 Profile learning runs automatically when the dashboard loads profile data. xsquared first checks Birdclaw's local authored-tweet store, then falls back to Bird's profile timeline fetch for `@therealtongchen` when local authored tweets are empty.
