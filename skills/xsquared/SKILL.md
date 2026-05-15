@@ -32,17 +32,28 @@ Draft/profile store:
 
     node scripts/xsquared.mjs doctor
 
-2. Gather trend/context signal. If the user gave a topic, include it:
+2. Save or inspect the user's posting area when they provide one:
+
+    node scripts/xsquared.mjs strategy-set --area "<area>" --json
+    node scripts/xsquared.mjs strategy --json
+
+For example: Google Ads for small business.
+
+3. Gather trend/context signal. If the user gave a topic, include it:
 
     node scripts/xsquared.mjs trends --topic "<topic>" --limit 40 --json
 
-3. Learn the user's writing style when authored tweets are available in Birdclaw:
+4. Learn the user's writing style when authored tweets are available in Birdclaw:
 
     node scripts/xsquared.mjs profile-learn --handle "@<handle>" --limit 200 --json
 
 If this returns zero tweets, tell the user Birdclaw needs an X archive import or authored sync before xsquared can learn from their history.
 
-4. Generate 3-8 strong X post candidates. Prefer:
+5. Generate 3-8 strong X post candidates:
+
+    node scripts/xsquared.mjs generate --area "<area>" --count 5 --json
+
+Prefer:
 
 - One clear idea per post.
 - Concrete claim or useful insight.
@@ -52,7 +63,7 @@ If this returns zero tweets, tell the user Birdclaw needs an X archive import or
 - Avoid hashtags unless the topic strongly benefits.
 - Match the latest profile snapshot's length, line-break, hashtag, link, and hook patterns when available.
 
-5. Save candidates:
+6. Save manually generated candidates:
 
     node scripts/xsquared.mjs save --topic "<topic>" --angle "<angle>" --score <1-100> --text "<post text>"
 
@@ -62,7 +73,7 @@ For batches, write JSON to a temp file and import:
 
 The JSON can be either an array of posts or { "posts": [...] } where each post has text, and optional topic, angle, score, notes, and source.
 
-6. Show the dashboard when useful:
+7. Show the dashboard when useful:
 
     node scripts/xsquared.mjs dashboard
 

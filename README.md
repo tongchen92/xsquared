@@ -19,13 +19,16 @@ Then open the dashboard URL printed by the command.
 OpenClaw workflow:
 
 - Generate 5 X posts about AI agents using xsquared.
+- Set my xsquared posting area to Google Ads for small business.
 - Rewrite the newest xsquared draft.
 - Open the xsquared dashboard.
 
 CLI:
 
     node scripts/xsquared.mjs doctor
+    node scripts/xsquared.mjs strategy-set --area "Google Ads for small business"
     node scripts/xsquared.mjs trends --topic "AI agents" --limit 40
+    node scripts/xsquared.mjs generate --area "Google Ads for small business" --count 5
     node scripts/xsquared.mjs profile-learn --handle "@tongchen92" --limit 200
     node scripts/xsquared.mjs profile --json
     node scripts/xsquared.mjs save --topic "AI agents" --angle "operator leverage" --text "..."
@@ -33,7 +36,14 @@ CLI:
     node scripts/xsquared.mjs dashboard --port 3888
     node scripts/xsquared.mjs post <post-id>
 
-The dashboard supports viewing generated posts, editing drafts, recording rewrite requests for OpenClaw, inspecting what xsquared has learned about your writing style, and posting approved drafts through birdclaw compose post.
+The dashboard supports setting a posting area, analyzing trends for that area, generating draft candidates, editing drafts, recording rewrite requests for OpenClaw, inspecting what xsquared has learned about your writing style, and posting approved drafts through birdclaw compose post.
+
+The automatic content loop is intentionally simple for the first version:
+
+1. Save a posting area, such as "Google Ads for small business".
+2. xsquared asks Birdclaw for current local X trend/context around that area.
+3. xsquared combines the trend terms with the latest writing-profile snapshot.
+4. It saves draft posts locally for review and rewrite.
 
 Profile learning uses Birdclaw's local authored-tweet store. If the Profile tab shows zero tweets, import your X archive into Birdclaw or run Birdclaw authored sync first, then click Learn Profile again.
 

@@ -10,6 +10,8 @@
   "scripts": {
     "dashboard": "node scripts/xsquared.mjs dashboard",
     "trends": "node scripts/xsquared.mjs trends",
+    "generate": "node scripts/xsquared.mjs generate",
+    "strategy": "node scripts/xsquared.mjs strategy",
     "list": "node scripts/xsquared.mjs list",
     "check": "node scripts/xsquared.mjs doctor"
   },
