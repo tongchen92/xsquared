@@ -27,6 +27,14 @@ Draft/profile store:
 
     .xsquared/store.json
 
+The dashboard routes are:
+
+    /posts
+    /generate
+    /profile
+
+Generated drafts, topics, feed/source snapshots, rewrite requests, and learned profile snapshots persist in `.xsquared/store.json` unless `XSQUARED_HOME` is set. Bird/Birdclaw source history lives in the local Birdclaw/Bird setup, including `~/.birdclaw`.
+
 ## Standard Workflow
 
 1. Check setup:

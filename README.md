@@ -16,7 +16,11 @@ Quick start:
     npm run check
     npm run dashboard
 
-Then open the dashboard URL printed by the command.
+Then open the dashboard URL printed by the command. Dashboard tabs are routable:
+
+    http://127.0.0.1:3888/posts
+    http://127.0.0.1:3888/generate
+    http://127.0.0.1:3888/profile
 
 OpenClaw workflow:
 
@@ -55,6 +59,8 @@ The automatic content loop is intentionally simple for the first version:
 
 Profile learning runs automatically when the dashboard loads profile data. xsquared first checks Birdclaw's local authored-tweet store, then falls back to Bird's profile timeline fetch for `@therealtongchen` when local authored tweets are empty.
 
-Privacy: xsquared stores generated content locally in .xsquared/store.json by default. It does not send data to X unless a post action is explicitly triggered.
+Persistence: xsquared stores generated drafts, topics, source snapshots, rewrite requests, and learned profile snapshots locally in `.xsquared/store.json` by default. Set `XSQUARED_HOME` to move that app-data directory. Bird/Birdclaw source history is read from the local Birdclaw/Bird setup, including `~/.birdclaw`.
+
+Privacy: xsquared does not send data to X unless a post action is explicitly triggered.
 
 Terms: Use at your own risk. Review content before publishing.
