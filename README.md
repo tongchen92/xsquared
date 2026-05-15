@@ -5,12 +5,14 @@ OpenClaw plugin for creating high-quality X posts from current Birdclaw context 
 xsquared is local-first:
 
 - Birdclaw is used for X/Twitter local context and final posting.
+- The CLI is written in TypeScript under src/ and compiled to dist/.
 - Drafts, trend snapshots, writing-profile snapshots, and rewrite requests live under .xsquared/ in the plugin repo unless XSQUARED_HOME is set.
 - Posting to X happens only when the user clicks the dashboard post button or runs the explicit post command.
 
 Quick start:
 
     npm install
+    npm run build
     npm run check
     npm run dashboard
 
@@ -25,16 +27,17 @@ OpenClaw workflow:
 
 CLI:
 
-    node scripts/xsquared.mjs doctor
-    node scripts/xsquared.mjs strategy-set --area "Google Ads for small business"
-    node scripts/xsquared.mjs trends --topic "AI agents" --limit 40
-    node scripts/xsquared.mjs generate --area "Google Ads for small business" --count 5
-    node scripts/xsquared.mjs profile-learn --handle "@tongchen92" --limit 200
-    node scripts/xsquared.mjs profile --json
-    node scripts/xsquared.mjs save --topic "AI agents" --angle "operator leverage" --text "..."
-    node scripts/xsquared.mjs list
-    node scripts/xsquared.mjs dashboard --port 3888
-    node scripts/xsquared.mjs post <post-id>
+    npm run build
+    node dist/xsquared.js doctor
+    node dist/xsquared.js strategy-set --area "Google Ads for small business"
+    node dist/xsquared.js trends --topic "AI agents" --limit 40
+    node dist/xsquared.js generate --area "Google Ads for small business" --count 5
+    node dist/xsquared.js profile-learn --handle "@tongchen92" --limit 200
+    node dist/xsquared.js profile --json
+    node dist/xsquared.js save --topic "AI agents" --angle "operator leverage" --text "..."
+    node dist/xsquared.js list
+    node dist/xsquared.js dashboard --port 3888
+    node dist/xsquared.js post <post-id>
 
 The dashboard supports setting a posting area, analyzing trends for that area, generating draft candidates, editing drafts, recording rewrite requests for OpenClaw, inspecting what xsquared has learned about your writing style, and posting approved drafts through birdclaw compose post.
 

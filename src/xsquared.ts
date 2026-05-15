@@ -52,7 +52,7 @@ function makeId(prefix) {
   return prefix + "_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
 }
 
-function run(cmd, args, options) {
+function run(cmd, args, options = {}) {
   const result = spawnSync(cmd, args, { encoding: "utf8", ...(options || {}) });
   return {
     ok: result.status === 0,
@@ -66,7 +66,7 @@ function run(cmd, args, options) {
 function birdclaw(args) {
   let last = null;
   for (const candidate of BIRDCLAW_CANDIDATES) {
-    const result = run(candidate, args);
+    const result: any = run(candidate, args);
     result.binary = candidate;
     if (result.ok) return result;
     last = result;
@@ -74,7 +74,7 @@ function birdclaw(args) {
   return last || run("birdclaw", args);
 }
 
-function output(value, json) {
+function output(value, json = false) {
   if (json) {
     process.stdout.write(JSON.stringify(value, null, 2) + "\n");
   } else if (typeof value === "string") {

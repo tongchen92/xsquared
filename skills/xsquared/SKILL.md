@@ -10,7 +10,7 @@ Use xsquared to create X content from Birdclaw context plus the user's topic or 
 ## Guardrails
 
 - Do not publish to X without explicit user approval or a direct user click in the dashboard.
-- Treat node scripts/xsquared.mjs post <id> as an external publishing action.
+- Treat node dist/xsquared.js post <id> as an external publishing action.
 - Drafting, listing, rewriting, and opening the local dashboard are safe internal work.
 - If Birdclaw auth is missing, keep drafting and report that posting is blocked by Birdclaw auth.
 
@@ -20,7 +20,8 @@ From this skill file, the plugin root is ../..
 
 Core script:
 
-    node scripts/xsquared.mjs
+    npm run build
+    node dist/xsquared.js
 
 Draft/profile store:
 
@@ -30,28 +31,29 @@ Draft/profile store:
 
 1. Check setup:
 
-    node scripts/xsquared.mjs doctor
+    npm run check
 
 2. Save or inspect the user's posting area when they provide one:
 
-    node scripts/xsquared.mjs strategy-set --area "<area>" --json
-    node scripts/xsquared.mjs strategy --json
+    npm run build
+    node dist/xsquared.js strategy-set --area "<area>" --json
+    node dist/xsquared.js strategy --json
 
 For example: Google Ads for small business.
 
 3. Gather trend/context signal. If the user gave a topic, include it:
 
-    node scripts/xsquared.mjs trends --topic "<topic>" --limit 40 --json
+    node dist/xsquared.js trends --topic "<topic>" --limit 40 --json
 
 4. Learn the user's writing style when authored tweets are available in Birdclaw:
 
-    node scripts/xsquared.mjs profile-learn --handle "@<handle>" --limit 200 --json
+    node dist/xsquared.js profile-learn --handle "@<handle>" --limit 200 --json
 
 If this returns zero tweets, tell the user Birdclaw needs an X archive import or authored sync before xsquared can learn from their history.
 
 5. Generate 3-8 strong X post candidates:
 
-    node scripts/xsquared.mjs generate --area "<area>" --count 5 --json
+    node dist/xsquared.js generate --area "<area>" --count 5 --json
 
 Prefer:
 
@@ -65,17 +67,17 @@ Prefer:
 
 6. Save manually generated candidates:
 
-    node scripts/xsquared.mjs save --topic "<topic>" --angle "<angle>" --score <1-100> --text "<post text>"
+    node dist/xsquared.js save --topic "<topic>" --angle "<angle>" --score <1-100> --text "<post text>"
 
 For batches, write JSON to a temp file and import:
 
-    node scripts/xsquared.mjs import-json /tmp/xsquared-posts.json
+    node dist/xsquared.js import-json /tmp/xsquared-posts.json
 
 The JSON can be either an array of posts or { "posts": [...] } where each post has text, and optional topic, angle, score, notes, and source.
 
 7. Show the dashboard when useful:
 
-    node scripts/xsquared.mjs dashboard
+    npm run dashboard
 
 ## Rewrite Workflow
 
@@ -83,21 +85,21 @@ When the user asks to rewrite or improve:
 
 1. Find the target post with:
 
-    node scripts/xsquared.mjs list --json
+    node dist/xsquared.js list --json
 
 2. Rewrite the selected post in OpenClaw.
 3. Update it:
 
-    node scripts/xsquared.mjs update <post-id> --text "<new text>" --notes "<what changed>"
+    node dist/xsquared.js update <post-id> --text "<new text>" --notes "<what changed>"
 
 4. If dashboard rewrite requests exist, inspect them:
 
-    node scripts/xsquared.mjs rewrite-requests --json
+    node dist/xsquared.js rewrite-requests --json
 
 ## Posting
 
 Only post after explicit approval:
 
-    node scripts/xsquared.mjs post <post-id>
+    node dist/xsquared.js post <post-id>
 
 Posting uses birdclaw compose post with the selected post text. Default Birdclaw account is acct_primary.
