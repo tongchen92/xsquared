@@ -5,7 +5,7 @@ OpenClaw plugin for creating high-quality X posts from current Birdclaw context 
 xsquared is local-first:
 
 - Birdclaw is used for X/Twitter local context and final posting.
-- Drafts, trend snapshots, and rewrite requests live under .xsquared/ in the plugin repo unless XSQUARED_HOME is set.
+- Drafts, trend snapshots, writing-profile snapshots, and rewrite requests live under .xsquared/ in the plugin repo unless XSQUARED_HOME is set.
 - Posting to X happens only when the user clicks the dashboard post button or runs the explicit post command.
 
 Quick start:
@@ -26,12 +26,16 @@ CLI:
 
     node scripts/xsquared.mjs doctor
     node scripts/xsquared.mjs trends --topic "AI agents" --limit 40
+    node scripts/xsquared.mjs profile-learn --handle "@tongchen92" --limit 200
+    node scripts/xsquared.mjs profile --json
     node scripts/xsquared.mjs save --topic "AI agents" --angle "operator leverage" --text "..."
     node scripts/xsquared.mjs list
     node scripts/xsquared.mjs dashboard --port 3888
     node scripts/xsquared.mjs post <post-id>
 
-The dashboard supports viewing generated posts, editing drafts, recording rewrite requests for OpenClaw, and posting approved drafts through birdclaw compose post.
+The dashboard supports viewing generated posts, editing drafts, recording rewrite requests for OpenClaw, inspecting what xsquared has learned about your writing style, and posting approved drafts through birdclaw compose post.
+
+Profile learning uses Birdclaw's local authored-tweet store. If the Profile tab shows zero tweets, import your X archive into Birdclaw or run Birdclaw authored sync first, then click Learn Profile again.
 
 Privacy: xsquared stores generated content locally in .xsquared/store.json by default. It does not send data to X unless a post action is explicitly triggered.
 

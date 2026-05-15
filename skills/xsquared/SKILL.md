@@ -22,7 +22,7 @@ Core script:
 
     node scripts/xsquared.mjs
 
-Draft store:
+Draft/profile store:
 
     .xsquared/store.json
 
@@ -36,7 +36,13 @@ Draft store:
 
     node scripts/xsquared.mjs trends --topic "<topic>" --limit 40 --json
 
-3. Generate 3-8 strong X post candidates. Prefer:
+3. Learn the user's writing style when authored tweets are available in Birdclaw:
+
+    node scripts/xsquared.mjs profile-learn --handle "@<handle>" --limit 200 --json
+
+If this returns zero tweets, tell the user Birdclaw needs an X archive import or authored sync before xsquared can learn from their history.
+
+4. Generate 3-8 strong X post candidates. Prefer:
 
 - One clear idea per post.
 - Concrete claim or useful insight.
@@ -44,8 +50,9 @@ Draft store:
 - No fake statistics or invented external facts.
 - Native X style: short first line, specific angle, optional crisp punchline.
 - Avoid hashtags unless the topic strongly benefits.
+- Match the latest profile snapshot's length, line-break, hashtag, link, and hook patterns when available.
 
-4. Save candidates:
+5. Save candidates:
 
     node scripts/xsquared.mjs save --topic "<topic>" --angle "<angle>" --score <1-100> --text "<post text>"
 
@@ -55,7 +62,7 @@ For batches, write JSON to a temp file and import:
 
 The JSON can be either an array of posts or { "posts": [...] } where each post has text, and optional topic, angle, score, notes, and source.
 
-5. Show the dashboard when useful:
+6. Show the dashboard when useful:
 
     node scripts/xsquared.mjs dashboard
 
