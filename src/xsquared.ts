@@ -26,7 +26,7 @@ const BIRDCLAW_CANDIDATES = process.env.BIRDCLAW_BIN
 function ensureStore() {
   mkdirSync(APP_DIR, { recursive: true });
   if (!existsSync(STORE_PATH)) {
-    writeFileSync(STORE_PATH, JSON.stringify({ version: 1, strategy: { contentArea: "", updatedAt: null }, posts: [], trendSnapshots: [], profileSnapshots: [], generationSnapshots: [], rewriteRequests: [], feedSnapshots: [], directions: [] }, null, 2));
+    writeFileSync(STORE_PATH, JSON.stringify({ version: 1, strategy: { contentArea: "", updatedAt: null }, posts: [], trendSnapshots: [], profileSnapshots: [], generationSnapshots: [], rewriteRequests: [], feedSnapshots: [], directions: [], chatMessages: [], chatConfig: {} }, null, 2));
   }
 }
 
@@ -41,6 +41,8 @@ function readStore() {
   store.rewriteRequests ||= [];
   store.feedSnapshots ||= [];
   store.directions ||= [];
+  store.chatMessages ||= [];
+  store.chatConfig ||= {};
   return store;
 }
 
@@ -77,6 +79,10 @@ function birdclaw(args) {
     last = result;
   }
   return last || run("birdclaw", args);
+}
+
+function openclaw(args, timeoutMs = 600000) {
+  return run("openclaw", args, { timeout: timeoutMs });
 }
 
 function output(value, json = false) {
@@ -379,6 +385,82 @@ function getProfileSnapshotsWithAutoLearn(force = false) {
     }
   }
   return readStore().profileSnapshots;
+}
+
+function resolveOpenClawSession() {
+  const store = readStore();
+  const configuredId = process.env.XSQUARED_OPENCLAW_SESSION_ID || store.chatConfig.sessionId || "";
+  if (configuredId) {
+    return {
+      connected: true,
+      sessionId: configuredId,
+      key: store.chatConfig.sessionKey || process.env.XSQUARED_OPENCLAW_SESSION_KEY || "configured",
+      source: process.env.XSQUARED_OPENCLAW_SESSION_ID ? "env" : "store"
+    };
+  }
+  const keyContains = process.env.XSQUARED_OPENCLAW_SESSION_KEY_CONTAINS || store.chatConfig.sessionKeyContains || "";
+  const result = openclaw(["sessions", "--all-agents", "--active", "720", "--limit", "50", "--json"], 15000);
+  if (!result.ok) {
+    return { connected: false, error: result.stderr.trim() || result.error || "openclaw sessions failed" };
+  }
+  const data: any = safeJson(result.stdout.trim());
+  const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+  const matches = sessions.filter(function(session) {
+    const key = String(session.key || "");
+    if (keyContains) return key.includes(keyContains);
+    return key.includes(":telegram:group:") && key.includes(":topic:");
+  });
+  const session = matches[0] || null;
+  if (!session || !session.sessionId) {
+    return { connected: false, error: keyContains ? "No OpenClaw session matched " + keyContains : "No recent Telegram topic session found" };
+  }
+  return {
+    connected: true,
+    sessionId: session.sessionId,
+    key: session.key || "",
+    source: keyContains ? "auto-key-match" : "auto-recent-telegram-topic",
+    updatedAt: session.updatedAt || null
+  };
+}
+
+function extractAgentReply(stdout) {
+  const trimmed = String(stdout || "").replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "").trim();
+  if (!trimmed) return "";
+  const parsed: any = safeJson(trimmed);
+  if (parsed && typeof parsed === "object") {
+    return String(parsed.reply || parsed.response || parsed.message || parsed.output || parsed.text || parsed.result?.reply || parsed.result?.message || parsed.result?.text || trimmed);
+  }
+  return trimmed;
+}
+
+function getChatState() {
+  return { messages: readStore().chatMessages.slice(-25), target: resolveOpenClawSession() };
+}
+
+function appendChatMessage(role, text, extra = {}) {
+  const store = readStore();
+  const message = { id: makeId("chat"), role, text: String(text || ""), createdAt: nowIso(), ...extra };
+  store.chatMessages.push(message);
+  store.chatMessages = store.chatMessages.slice(-100);
+  writeStore(store);
+  return message;
+}
+
+function sendChatMessage(input) {
+  const message = String(input.message || "").trim();
+  if (!message) throw new Error("message is required");
+  const target = resolveOpenClawSession();
+  appendChatMessage("user", message, { target });
+  if (!target.connected || !target.sessionId) {
+    const error = target.error || "No OpenClaw session connected";
+    appendChatMessage("system", error, { failed: true, target });
+    throw new Error(error);
+  }
+  const result = openclaw(["agent", "--session-id", target.sessionId, "--message", message, "--json"], 600000);
+  const reply = extractAgentReply(result.stdout) || result.stderr.trim() || result.error || "No reply returned.";
+  appendChatMessage(result.ok ? "assistant" : "system", reply, { ok: result.ok, status: result.status, target });
+  if (!result.ok) throw new Error(reply);
+  return getChatState();
 }
 
 function setStrategy(input) {
@@ -793,7 +875,7 @@ function escapeHtml(value) {
 }
 
 function html() {
-  const CSS = ":root{color-scheme:light dark;--bg:#FAFAF7;--panel:#FFFFFF;--ink:#0A0A0A;--muted:#6B6B6B;--line:#E5E4DE;--accent:#B8542A;--accent-soft:#F2E3D9;--success:#15803D;--error:#B42318;--info:#1F4E8C;--r-sm:4px;--r-md:6px;--r-lg:8px;--shadow-1:0 1px 0 rgba(10,10,10,.03);--font-ui:'Geist','Geist Sans',ui-sans-serif,system-ui,sans-serif;--font-display:'Fraunces',Georgia,serif;--font-mono:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}@media (prefers-color-scheme:dark){:root{--bg:#0E0E0C;--panel:#161614;--ink:#F5F5F0;--muted:#A3A3A0;--line:#2A2A26;--accent:#C56A3F;--accent-soft:#2A1B14;--shadow-1:0 1px 0 rgba(0,0,0,.4)}}*{box-sizing:border-box}body{margin:0;font-family:var(--font-ui);font-size:14px;line-height:1.5;background:var(--bg);color:var(--ink);font-feature-settings:'ss01','cv11'}header{position:sticky;top:0;z-index:2;background:var(--bg);border-bottom:1px solid var(--line)}.bar{max-width:1180px;margin:0 auto;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{display:flex;align-items:baseline;gap:12px}h1{margin:0;font-family:var(--font-display);font-weight:600;font-size:26px;letter-spacing:-.01em;line-height:1}.brand-mark{color:var(--accent)}.brand-tag{font-family:var(--font-mono);font-size:11px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}.nav-tabs{display:flex;gap:4px}.nav-tab{appearance:none;background:transparent;border:none;border-radius:var(--r-sm);color:var(--muted);font-family:var(--font-ui);font-weight:500;font-size:14px;padding:6px 12px;cursor:pointer;position:relative}.nav-tab:hover{color:var(--ink)}.nav-tab.active{color:var(--ink)}.nav-tab.active::after{content:'';position:absolute;left:12px;right:12px;bottom:-18px;height:2px;background:var(--accent);border-radius:2px}.tools{display:flex;gap:8px}main{max-width:1180px;margin:0 auto;padding:24px;display:grid;grid-template-columns:320px 1fr;gap:24px}button,input,textarea,select{font:inherit}button{font-family:var(--font-ui);border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:var(--r-sm);padding:8px 12px;cursor:pointer;font-weight:500;transition:background 150ms ease-out,border-color 150ms ease-out,color 150ms ease-out,transform 80ms ease-out}button:hover{border-color:var(--ink)}button:active{transform:translateY(1px)}button.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}button.primary:hover{background:#000;border-color:#000}button.accent{background:var(--accent);color:#fff;border-color:var(--accent)}button.accent:hover{background:#9F4823;border-color:#9F4823}button.danger-confirm{background:var(--accent);color:#fff;border-color:var(--accent)}button.ghost{background:transparent;border-color:transparent;color:var(--muted)}button.ghost:hover{color:var(--ink);background:var(--accent-soft);border-color:transparent}button:disabled{opacity:.5;cursor:not-allowed;transform:none}button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,.nav-tab:focus-visible{outline:2px solid var(--accent);outline-offset:2px}input,textarea,select{width:100%;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:var(--r-sm);padding:10px 12px;font-family:var(--font-ui);transition:border-color 150ms ease-out}input:hover,textarea:hover,select:hover{border-color:#B5B5AE}input::placeholder,textarea::placeholder{color:var(--muted);opacity:.7}textarea{min-height:128px;resize:vertical;line-height:1.45}.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:20px;box-shadow:var(--shadow-1)}.panel-head{font-family:var(--font-display);font-weight:500;font-size:13px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);margin:0 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}.side{display:grid;gap:16px;align-self:start;position:sticky;top:84px}.field{display:grid;gap:6px;margin-bottom:12px}.field:last-child{margin-bottom:0}label{color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.01em}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.posts{display:grid;gap:14px}.post,.profile-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:20px;display:grid;gap:12px;box-shadow:var(--shadow-1)}.post textarea{min-height:96px}.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}.metric{border:1px solid var(--line);border-radius:var(--r-sm);padding:12px;background:var(--bg);font-variant-numeric:tabular-nums}.metric b{display:block;font-family:var(--font-display);font-weight:500;font-size:24px;line-height:1.1;letter-spacing:-.01em}.metric span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}.meta{color:var(--muted);font-size:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}.meta time,.meta .ts{font-family:var(--font-mono);font-size:11px}.pill{border:1px solid var(--line);border-radius:9999px;padding:2px 8px;background:var(--panel);font-size:11px;color:var(--muted);font-weight:500}.pill-source{border-color:var(--accent);color:var(--accent)}.pill-status{border-color:var(--ink);color:var(--ink);background:var(--bg);text-transform:lowercase;font-family:var(--font-mono);font-size:10px;letter-spacing:.04em;padding:2px 7px}.pill-status[data-status='posted']{border-color:var(--success);color:var(--success);background:transparent}.pill-status[data-status='failed']{border-color:var(--error);color:var(--error);background:transparent}.score{color:var(--accent);font-variant-numeric:tabular-nums;font-weight:500}.posted{color:var(--success);font-size:12px}.failed{color:var(--error);white-space:pre-wrap;font-size:12px;padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--error)}.trend-list{display:grid;gap:0;font-size:13px;color:var(--ink)}.trend-list span{display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line);padding:6px 0;font-variant-numeric:tabular-nums}.trend-list span:last-child{border-bottom:none}.trend-list b{font-weight:500}.trend-list em{font-style:normal;color:var(--muted);font-family:var(--font-mono);font-size:11px}.sample{white-space:pre-wrap;border-top:1px solid var(--line);padding-top:12px;margin-top:4px;color:var(--ink);line-height:1.55}.empty{color:var(--muted);padding:32px 24px;border:1px solid var(--line);border-radius:var(--r-md);background:var(--panel);display:grid;gap:8px}.empty-title{font-family:var(--font-display);font-weight:500;font-size:18px;color:var(--ink);letter-spacing:-.01em}.empty-body{font-size:13px;line-height:1.5}.status-bar{font-family:var(--font-mono);font-size:11px;color:var(--muted);padding:10px 12px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--line);min-height:38px;display:flex;align-items:center;gap:8px}.status-bar.success{color:var(--success);border-color:var(--success)}.status-bar.failed{color:var(--error);border-color:var(--error);white-space:pre-wrap;align-items:flex-start;line-height:1.4}.status-bar::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-family:var(--font-mono);font-size:11px}.kv dt{color:var(--muted)}.kv dd{margin:0;color:var(--ink)}.source-tabs{display:flex;gap:4px;margin-bottom:12px}.source-tab{flex:1;text-align:center;font-size:12px;padding:6px 8px;border-radius:var(--r-sm);cursor:pointer;border:1px solid var(--line);background:var(--panel);color:var(--muted);font-weight:500;transition:background 150ms ease-out,color 150ms ease-out,border-color 150ms ease-out}.source-tab:hover{color:var(--ink);border-color:var(--muted)}.source-tab.active{background:var(--ink);color:var(--bg);border-color:var(--ink)}.feed-post{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px;cursor:pointer;box-shadow:var(--shadow-1);transition:border-color 150ms ease-out}.feed-post:hover{border-color:var(--muted)}.feed-post.selected{border-color:var(--accent);background:var(--accent-soft)}.feed-post-body{font-size:13px;line-height:1.55;white-space:pre-wrap;margin:6px 0 0}.feed-post-meta{display:flex;gap:8px;align-items:center;font-size:11px;color:var(--muted)}.dir-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px;cursor:pointer;box-shadow:var(--shadow-1);transition:border-color 150ms ease-out}.dir-card:hover{border-color:var(--muted)}.dir-card.active-dir{border-color:var(--accent)}.dir-name{font-weight:500;font-size:14px}.dir-desc{font-size:12px;color:var(--muted);line-height:1.4;margin-top:4px}.dir-meta-row{font-size:11px;color:var(--muted);margin-top:6px;font-family:var(--font-mono)}.sel-bar{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);margin-bottom:12px}.sel-count{font-size:13px;font-weight:500}.feed-grid,.dir-grid{display:grid;gap:10px}.note-block{font-size:12px;color:var(--muted);padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--line)}@media(max-width:820px){main{grid-template-columns:1fr;padding:16px;gap:16px}.side{position:static;top:auto}.bar{padding:14px 16px;gap:12px;flex-wrap:wrap}.nav-tab.active::after{bottom:-14px}}@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}";
+  const CSS = ":root{color-scheme:light dark;--bg:#FAFAF7;--panel:#FFFFFF;--ink:#0A0A0A;--muted:#6B6B6B;--line:#E5E4DE;--accent:#B8542A;--accent-soft:#F2E3D9;--success:#15803D;--error:#B42318;--info:#1F4E8C;--r-sm:4px;--r-md:6px;--r-lg:8px;--shadow-1:0 1px 0 rgba(10,10,10,.03);--font-ui:'Geist','Geist Sans',ui-sans-serif,system-ui,sans-serif;--font-display:'Fraunces',Georgia,serif;--font-mono:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}@media (prefers-color-scheme:dark){:root{--bg:#0E0E0C;--panel:#161614;--ink:#F5F5F0;--muted:#A3A3A0;--line:#2A2A26;--accent:#C56A3F;--accent-soft:#2A1B14;--shadow-1:0 1px 0 rgba(0,0,0,.4)}}*{box-sizing:border-box}body{margin:0;font-family:var(--font-ui);font-size:14px;line-height:1.5;background:var(--bg);color:var(--ink);font-feature-settings:'ss01','cv11'}header{position:sticky;top:0;z-index:2;background:var(--bg);border-bottom:1px solid var(--line)}.bar{max-width:1180px;margin:0 auto;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{display:flex;align-items:baseline;gap:12px}h1{margin:0;font-family:var(--font-display);font-weight:600;font-size:26px;letter-spacing:-.01em;line-height:1}.brand-mark{color:var(--accent)}.brand-tag{font-family:var(--font-mono);font-size:11px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}.nav-tabs{display:flex;gap:4px}.nav-tab{appearance:none;background:transparent;border:none;border-radius:var(--r-sm);color:var(--muted);font-family:var(--font-ui);font-weight:500;font-size:14px;padding:6px 12px;cursor:pointer;position:relative}.nav-tab:hover{color:var(--ink)}.nav-tab.active{color:var(--ink)}.nav-tab.active::after{content:'';position:absolute;left:12px;right:12px;bottom:-18px;height:2px;background:var(--accent);border-radius:2px}.tools{display:flex;gap:8px}main{max-width:1180px;margin:0 auto;padding:24px;display:grid;grid-template-columns:320px 1fr;gap:24px}button,input,textarea,select{font:inherit}button{font-family:var(--font-ui);border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:var(--r-sm);padding:8px 12px;cursor:pointer;font-weight:500;transition:background 150ms ease-out,border-color 150ms ease-out,color 150ms ease-out,transform 80ms ease-out}button:hover{border-color:var(--ink)}button:active{transform:translateY(1px)}button.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}button.primary:hover{background:#000;border-color:#000}button.accent{background:var(--accent);color:#fff;border-color:var(--accent)}button.accent:hover{background:#9F4823;border-color:#9F4823}button.danger-confirm{background:var(--accent);color:#fff;border-color:var(--accent)}button.ghost{background:transparent;border-color:transparent;color:var(--muted)}button.ghost:hover{color:var(--ink);background:var(--accent-soft);border-color:transparent}button:disabled{opacity:.5;cursor:not-allowed;transform:none}button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,.nav-tab:focus-visible{outline:2px solid var(--accent);outline-offset:2px}input,textarea,select{width:100%;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:var(--r-sm);padding:10px 12px;font-family:var(--font-ui);transition:border-color 150ms ease-out}input:hover,textarea:hover,select:hover{border-color:#B5B5AE}input::placeholder,textarea::placeholder{color:var(--muted);opacity:.7}textarea{min-height:128px;resize:vertical;line-height:1.45}.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:20px;box-shadow:var(--shadow-1)}.panel-head{font-family:var(--font-display);font-weight:500;font-size:13px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);margin:0 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}.side{display:grid;gap:16px;align-self:start;position:sticky;top:84px}.field{display:grid;gap:6px;margin-bottom:12px}.field:last-child{margin-bottom:0}label{color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.01em}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.posts{display:grid;gap:14px}.post,.profile-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:20px;display:grid;gap:12px;box-shadow:var(--shadow-1)}.post textarea{min-height:96px}.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}.metric{border:1px solid var(--line);border-radius:var(--r-sm);padding:12px;background:var(--bg);font-variant-numeric:tabular-nums}.metric b{display:block;font-family:var(--font-display);font-weight:500;font-size:24px;line-height:1.1;letter-spacing:-.01em}.metric span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}.meta{color:var(--muted);font-size:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}.meta time,.meta .ts{font-family:var(--font-mono);font-size:11px}.pill{border:1px solid var(--line);border-radius:9999px;padding:2px 8px;background:var(--panel);font-size:11px;color:var(--muted);font-weight:500}.pill-source{border-color:var(--accent);color:var(--accent)}.pill-status{border-color:var(--ink);color:var(--ink);background:var(--bg);text-transform:lowercase;font-family:var(--font-mono);font-size:10px;letter-spacing:.04em;padding:2px 7px}.pill-status[data-status='posted']{border-color:var(--success);color:var(--success);background:transparent}.pill-status[data-status='failed']{border-color:var(--error);color:var(--error);background:transparent}.score{color:var(--accent);font-variant-numeric:tabular-nums;font-weight:500}.posted{color:var(--success);font-size:12px}.failed{color:var(--error);white-space:pre-wrap;font-size:12px;padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--error)}.trend-list{display:grid;gap:0;font-size:13px;color:var(--ink)}.trend-list span{display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line);padding:6px 0;font-variant-numeric:tabular-nums}.trend-list span:last-child{border-bottom:none}.trend-list b{font-weight:500}.trend-list em{font-style:normal;color:var(--muted);font-family:var(--font-mono);font-size:11px}.sample{white-space:pre-wrap;border-top:1px solid var(--line);padding-top:12px;margin-top:4px;color:var(--ink);line-height:1.55}.empty{color:var(--muted);padding:32px 24px;border:1px solid var(--line);border-radius:var(--r-md);background:var(--panel);display:grid;gap:8px}.empty-title{font-family:var(--font-display);font-weight:500;font-size:18px;color:var(--ink);letter-spacing:-.01em}.empty-body{font-size:13px;line-height:1.5}.status-bar{font-family:var(--font-mono);font-size:11px;color:var(--muted);padding:10px 12px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--line);min-height:38px;display:flex;align-items:center;gap:8px}.status-bar.success{color:var(--success);border-color:var(--success)}.status-bar.failed{color:var(--error);border-color:var(--error);white-space:pre-wrap;align-items:flex-start;line-height:1.4}.status-bar::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-family:var(--font-mono);font-size:11px}.kv dt{color:var(--muted)}.kv dd{margin:0;color:var(--ink)}.operator-state{display:grid;gap:6px;margin-bottom:12px}.operator-state span,.chat-target{font-family:var(--font-mono);font-size:11px;color:var(--muted);word-break:break-word}.chat-log{max-height:220px;overflow:auto;display:grid;gap:8px;margin:10px 0}.chat-msg{border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;background:var(--bg);font-size:12px;white-space:pre-wrap}.chat-msg.user{background:var(--panel);border-color:var(--accent)}.chat-msg.assistant{border-color:var(--line)}.chat-msg.system{color:var(--error);border-color:var(--error)}.chat-role{display:block;font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px}.chat-form textarea{min-height:76px}.source-tabs{display:flex;gap:4px;margin-bottom:12px}.source-tab{flex:1;text-align:center;font-size:12px;padding:6px 8px;border-radius:var(--r-sm);cursor:pointer;border:1px solid var(--line);background:var(--panel);color:var(--muted);font-weight:500;transition:background 150ms ease-out,color 150ms ease-out,border-color 150ms ease-out}.source-tab:hover{color:var(--ink);border-color:var(--muted)}.source-tab.active{background:var(--ink);color:var(--bg);border-color:var(--ink)}.feed-post{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px;cursor:pointer;box-shadow:var(--shadow-1);transition:border-color 150ms ease-out}.feed-post:hover{border-color:var(--muted)}.feed-post.selected{border-color:var(--accent);background:var(--accent-soft)}.feed-post-body{font-size:13px;line-height:1.55;white-space:pre-wrap;margin:6px 0 0}.feed-post-meta{display:flex;gap:8px;align-items:center;font-size:11px;color:var(--muted)}.dir-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px;cursor:pointer;box-shadow:var(--shadow-1);transition:border-color 150ms ease-out}.dir-card:hover{border-color:var(--muted)}.dir-card.active-dir{border-color:var(--accent)}.dir-name{font-weight:500;font-size:14px}.dir-desc{font-size:12px;color:var(--muted);line-height:1.4;margin-top:4px}.dir-meta-row{font-size:11px;color:var(--muted);margin-top:6px;font-family:var(--font-mono)}.sel-bar{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);margin-bottom:12px}.sel-count{font-size:13px;font-weight:500}.feed-grid,.dir-grid{display:grid;gap:10px}.note-block{font-size:12px;color:var(--muted);padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--line)}@media(max-width:820px){main{grid-template-columns:1fr;padding:16px;gap:16px}.side{position:static;top:auto}.bar{padding:14px 16px;gap:12px;flex-wrap:wrap}.nav-tab.active::after{bottom:-14px}}@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}";
 
   const HEADER = "<header><div class=\"bar\"><div class=\"brand\"><h1><span class=\"brand-mark\">x</span>squared</h1><span class=\"brand-tag\">drafts</span></div><nav class=\"nav-tabs\" aria-label=\"Primary\"><button class=\"nav-tab active\" data-tab=\"posts\" data-route=\"/posts\">Posts</button><button class=\"nav-tab\" data-tab=\"generate\" data-route=\"/generate\">Generate</button><button class=\"nav-tab\" data-tab=\"profile\" data-route=\"/profile\">Profile</button></nav><div class=\"tools\"><button id=\"doctor\" class=\"ghost\">Doctor</button><button id=\"refresh\" class=\"ghost\">Refresh</button></div></div></header>";
 
@@ -802,11 +884,12 @@ function html() {
   const SIDEBAR_GEN = "<div id=\"gen-side\" style=\"display:none\"><section class=\"panel\"><h2 class=\"panel-head\">Source</h2><div class=\"source-tabs\"><button class=\"source-tab active\" data-source=\"direction\">Topic</button><button class=\"source-tab\" data-source=\"feed\">Trending</button></div><div id=\"direction-side\"><button id=\"newDirBtn\" class=\"primary\" style=\"width:100%;margin-bottom:10px\">+ New topic</button><div id=\"dirSideMeta\" style=\"font-size:12px;color:var(--muted);margin-bottom:8px\">Select a topic to generate from it.</div><div id=\"dirGenerateSide\" style=\"display:none\"><button id=\"genFromDirBtn\" class=\"accent\" style=\"width:100%\">Generate topic posts</button></div></div><div id=\"feed-side\" style=\"display:none\"><div class=\"field\"><label>Trending filter</label><input id=\"feedTopic\" placeholder=\"Optional: Google Ads, AI agents...\"></div><div class=\"row\" style=\"margin-bottom:12px\"><button id=\"fetchFeedBtn\" class=\"primary\">Fetch trending posts</button></div><div id=\"feedSideMeta\" style=\"font-size:12px;color:var(--muted)\"></div><div id=\"feedGenerateSide\" style=\"display:none;margin-top:12px\"><div class=\"field\"><label>Your angle / topic</label><input id=\"feedArea\" placeholder=\"Google Ads for small business\"></div><button id=\"genFromFeedBtn\" class=\"accent\" style=\"width:100%\">Generate my versions</button></div></div></section></div>";
 
   const SIDEBAR_SYS = "<section class=\"panel\"><h2 class=\"panel-head\">System</h2><div id=\"status\" class=\"status-bar\">Ready.</div></section>";
+  const SIDEBAR_CHAT = "<section class=\"panel\"><h2 class=\"panel-head\">Eigen</h2><div id=\"operatorState\" class=\"operator-state\"></div><div id=\"chatTarget\" class=\"chat-target\">Checking session...</div><div id=\"chatLog\" class=\"chat-log\"></div><div class=\"chat-form\"><textarea id=\"chatInput\" placeholder=\"Ask Eigen about these drafts...\"></textarea><button id=\"chatSend\" class=\"primary\" style=\"width:100%\">Send to this session</button></div></section>";
 
   const CONTENT_GEN = "<div id=\"generate\" style=\"display:none\"><div id=\"gen-dir-view\"><div id=\"dir-editor-card\" class=\"post\" style=\"display:none;margin-bottom:14px\"><div class=\"meta\"><span id=\"dirEditLabel\" class=\"pill\">New topic</span></div><div class=\"field\"><label>Topic name</label><input id=\"dirName\" placeholder=\"Google Ads for small business\"></div><div class=\"field\"><label>Angle / objective</label><textarea id=\"dirDesc\" style=\"min-height:80px\" placeholder=\"What specific angle or claim do you want posts about?\"></textarea></div><div class=\"field\"><label>Reference material</label><textarea id=\"dirRefs\" style=\"min-height:180px\" placeholder=\"Paste notes, research, examples, constraints... Separate multiple references with a line containing only ---\"></textarea></div><div class=\"field\"><label style=\"display:flex;align-items:center;gap:8px;cursor:pointer\"><input type=\"checkbox\" id=\"dirUseTweets\" style=\"width:auto\"> Use learned tweet samples for voice</label></div><div class=\"row\"><button id=\"saveDirBtn\" class=\"primary\">Save topic</button><button id=\"cancelDirBtn\" class=\"ghost\">Cancel</button><button id=\"deleteDirBtn\" class=\"danger-confirm\" style=\"display:none\">Delete</button></div></div><div id=\"dir-grid\" class=\"dir-grid\"></div><div id=\"dir-empty\" class=\"empty\" style=\"display:none\"><div class=\"empty-title\">No topics yet.</div><div class=\"empty-body\">Click <b>+ New topic</b> to define one or many areas you want to post about, then generate drafts for the selected topic.</div></div></div><div id=\"gen-feed-view\" style=\"display:none\"><div id=\"feed-sel-bar\" class=\"sel-bar\" style=\"display:none\"><span class=\"sel-count\" id=\"feedSelCount\">0 selected</span><span style=\"font-size:12px;color:var(--muted)\">Click viral/relevant posts to select · drafts go to Posts tab</span></div><div id=\"feed-posts-grid\" class=\"feed-grid\"></div><div id=\"feed-empty\" class=\"empty\"><div class=\"empty-title\">No trending posts yet.</div><div class=\"empty-body\">Fetch viral or relevant feed posts, select the ones worth recreating, then generate your versions.</div></div></div></div>";
 
   const JS = `const $=id=>document.getElementById(id);
-let posts=[],profileSnapshots=[],feedSnapshot=null,selectedFeedIds=new Set(),directions=[],activeDirId=null,editingDirId=null;
+let posts=[],profileSnapshots=[],feedSnapshot=null,selectedFeedIds=new Set(),directions=[],activeDirId=null,editingDirId=null,chatMessages=[],chatTarget=null;
 const pendingPost=new Map();
 function setStatus(t,c){const e=$('status');e.className='status-bar'+(c?' '+c:'');e.textContent=t}
 async function api(p,o={}){const r=await fetch(p,{headers:{'content-type':'application/json'},...o});const b=await r.json().catch(()=>({}));if(!r.ok)throw new Error(b.error||r.statusText);return b}
@@ -832,7 +915,17 @@ function renderProfile(){
   if(!s){root.innerHTML='<div class="empty"><div class="empty-title">No profile snapshot yet.</div><div class="empty-body">xsquared learns your profile automatically from Birdclaw when this tab loads.</div></div>';return}
   const p=s.profile||{};const m=p.metrics||{};
   root.innerHTML='<article class="profile-card"><div class="meta"><span class="pill">'+esc(s.handle||'authored')+'</span><span class="ts">'+fmtDate(s.createdAt)+'</span><span>'+esc(p.sampleCount||0)+' tweets</span></div>'+(s.note?'<div class="failed">'+esc(s.note)+'</div>':'')+'<div class="metric-grid">'+metric('median chars',m.medianChars||0)+metric('median lines',m.medianLines||0)+metric('short posts',String(m.shortPostPct||0)+'%')+metric('links',String(m.linkPct||0)+'%')+metric('questions',String(m.questionPct||0)+'%')+metric('hashtags',String(m.hashtagPct||0)+'%')+'</div><div><b>Style guidance</b><div class="trend-list">'+(p.guidance||[]).map(x=>'<span>'+esc(x)+'</span>').join('')+'</div></div><div><b>Common terms</b><div class="trend-list">'+(((p.terms||{}).terms||[]).slice(0,12).map(t=>'<span><b>'+esc(t.term)+'</b><em>'+t.count+'</em></span>').join('')||'<span>None yet</span>')+'</div></div><div><b>Repeated phrases</b><div class="trend-list">'+((p.phrases||[]).slice(0,12).map(t=>'<span><b>'+esc(t.phrase)+'</b><em>'+t.count+'</em></span>').join('')||'<span>None yet</span>')+'</div></div><div><b>Sample posts</b>'+((p.samples||[]).map(x=>'<div class="sample">'+esc(x.text)+'</div>').join('')||'<div class="sample">No samples.</div>')+'</div></article>'}
-async function load(){const d=await api('/api/posts');posts=d.posts;renderPosts();const p=await api('/api/profile');profileSnapshots=p.profileSnapshots;renderProfile()}
+function renderOperator(){
+  const s=profileSnapshots[0];const p=s&&s.profile||{};
+  $('operatorState').innerHTML='<span>Voice: '+esc(p.sampleCount||0)+' tweet samples</span><span>Sources: topic + trending</span><span>Store: .xsquared/store.json</span>';
+  $('chatTarget').textContent=chatTarget&&chatTarget.connected?'Connected: '+(chatTarget.key||chatTarget.sessionId):'Chat not connected';
+}
+function renderChat(){
+  $('chatLog').innerHTML=chatMessages.length?chatMessages.slice(-8).map(m=>'<div class="chat-msg '+esc(m.role||'system')+'"><span class="chat-role">'+esc(m.role||'system')+'</span>'+esc(m.text||'')+'</div>').join(''):'<div class="chat-msg system"><span class="chat-role">system</span>No UI chat yet.</div>';
+  $('chatLog').scrollTop=$('chatLog').scrollHeight;
+}
+async function loadChat(){const c=await api('/api/chat');chatMessages=c.messages||[];chatTarget=c.target||null;renderOperator();renderChat()}
+async function load(){const d=await api('/api/posts');posts=d.posts;renderPosts();const p=await api('/api/profile');profileSnapshots=p.profileSnapshots;renderProfile();await loadChat().catch(()=>renderOperator())}
 const SIDE_PANELS=[];
 function routeToTab(path){
   if(path==='/generate')return 'generate';
@@ -854,6 +947,8 @@ document.querySelectorAll('.nav-tab').forEach(b=>b.onclick=()=>showTab(b.dataset
 window.addEventListener('popstate',()=>showTab(routeToTab(window.location.pathname),{skipHistory:true}));
 $('refresh').onclick=()=>load().catch(e=>setStatus(e.message,'failed'));
 $('doctor').onclick=async()=>{try{setStatus('Checking Birdclaw...');const d=await api('/api/doctor');const b=d.birdclaw||{};const ok=b.installed&&b.authOk;setStatus([b.installed?'Birdclaw '+(b.version||'?')+' ✓':'Birdclaw ✗',b.authOk?'auth ok ✓':'auth ✗'].join('  ·  '),ok?'success':'failed')}catch(e){setStatus(e.message,'failed')}};
+$('chatSend').onclick=async()=>{const text=$('chatInput').value.trim();if(!text)return;const btn=$('chatSend');const orig=btn.textContent;try{btn.disabled=true;btn.textContent='Sending...';setStatus('Sending to OpenClaw session...');const data=await api('/api/chat',{method:'POST',body:JSON.stringify({message:text})});$('chatInput').value='';chatMessages=data.messages||[];chatTarget=data.target||chatTarget;renderOperator();renderChat();setStatus('OpenClaw replied in the UI chat.','success')}catch(e){setStatus(e.message,'failed');await loadChat().catch(()=>{})}finally{btn.disabled=false;btn.textContent=orig}};
+$('chatInput').addEventListener('keydown',ev=>{if((ev.metaKey||ev.ctrlKey)&&ev.key==='Enter')$('chatSend').click()});
 $('posts').onclick=async ev=>{const b=ev.target.closest('button');if(!b)return;const c=ev.target.closest('.post');const id=c.dataset.id;const action=b.dataset.action;try{if(action==='save'){await api('/api/posts/'+id,{method:'PATCH',body:JSON.stringify({text:c.querySelector('[data-field="text"]').value})});setStatus('Saved.','success')}if(action==='rewrite'){await api('/api/posts/'+id+'/rewrite-request',{method:'POST',body:JSON.stringify({instruction:c.querySelector('[data-field="rewrite"]').value})});setStatus('Rewrite request saved.','success')}if(action==='post'){if(!pendingPost.has(id)){const orig=b.textContent;b.classList.add('danger-confirm');b.textContent='Click again to post';const t=setTimeout(()=>{if(pendingPost.get(id)===t){pendingPost.delete(id);b.classList.remove('danger-confirm');b.textContent=orig}},6000);pendingPost.set(id,t);setStatus('Confirm: click again within 6s to post.');return}clearTimeout(pendingPost.get(id));pendingPost.delete(id);b.classList.remove('danger-confirm');b.textContent='Posting...';b.disabled=true;await api('/api/posts/'+id+'/post',{method:'POST'});setStatus('Posted. Check card for result.','success')}await load()}catch(e){setStatus(e.message,'failed');b.disabled=false;b.textContent='Post to X';b.classList.remove('danger-confirm')}};
 load().then(()=>showTab(routeToTab(window.location.pathname),{skipHistory:true})).catch(e=>setStatus(e.message,'failed'));
 
@@ -976,7 +1071,7 @@ $('genFromDirBtn').onclick=async()=>{
     "<link href=\"https://fonts.bunny.net/css?family=geist:400,500,600|geist-mono:400,500|fraunces:500,600&display=swap\" rel=\"stylesheet\">",
     "<style>" + CSS + "</style></head><body>",
     HEADER,
-    "<main><aside class=\"side\">" + SIDEBAR_POSTS + SIDEBAR_GEN + SIDEBAR_SYS + "</aside>",
+    "<main><aside class=\"side\">" + SIDEBAR_POSTS + SIDEBAR_GEN + SIDEBAR_CHAT + SIDEBAR_SYS + "</aside>",
     "<section><div id=\"posts\" class=\"posts\"></div><div id=\"profile\" class=\"posts\" style=\"display:none\"></div>" + CONTENT_GEN + "</section></main>",
     "<script>" + JS + "</script></body></html>"
   ].join("\n");
@@ -1027,6 +1122,14 @@ function startDashboard(port, host) {
       }
       if (req.method === "GET" && url.pathname === "/api/profile") {
         sendJson(res, 200, { profileSnapshots: getProfileSnapshotsWithAutoLearn(url.searchParams.get("refresh") === "1") });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/chat") {
+        sendJson(res, 200, getChatState());
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/chat") {
+        sendJson(res, 200, sendChatMessage(await readBody(req)));
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/profile/learn") {

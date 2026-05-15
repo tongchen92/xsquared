@@ -35,6 +35,8 @@ The dashboard routes are:
 
 Generated drafts, topics, feed/source snapshots, rewrite requests, and learned profile snapshots persist in `.xsquared/store.json` unless `XSQUARED_HOME` is set. Bird/Birdclaw source history lives in the local Birdclaw/Bird setup, including `~/.birdclaw`.
 
+The dashboard sidebar has an Eigen chat panel. It auto-detects a recent OpenClaw Telegram topic session and uses `openclaw agent --session-id` so the user can chat from the local UI. The local UI transcript is stored in `.xsquared/store.json`.
+
 ## Standard Workflow
 
 1. Check setup:

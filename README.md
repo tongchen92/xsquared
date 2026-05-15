@@ -50,6 +50,8 @@ The dashboard splits generation and review into two sources:
 
 The Posts tab groups drafts by Topic and Trending. It supports editing drafts, recording rewrite requests for OpenClaw, inspecting what xsquared has learned about your writing style, and posting approved drafts through birdclaw compose post.
 
+The sidebar includes an Eigen chat panel. It auto-detects the latest OpenClaw Telegram topic session and sends messages back into that session with `openclaw agent --session-id`; the UI stores its local transcript in `.xsquared/store.json`.
+
 The automatic content loop is intentionally simple for the first version:
 
 1. Use Topic when you already know what you want to post about, such as "Google Ads for small business".
