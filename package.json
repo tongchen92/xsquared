@@ -7,6 +7,14 @@
   "bin": {
     "xsquared": "./dist/xsquared.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tongchen92/xsquared.git"
+  },
+  "homepage": "https://github.com/tongchen92/xsquared#readme",
+  "bugs": {
+    "url": "https://github.com/tongchen92/xsquared/issues"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dashboard": "npm run build --silent && node dist/xsquared.js dashboard",

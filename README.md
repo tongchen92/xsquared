@@ -41,6 +41,12 @@ CLI:
 
 The dashboard supports setting a posting area, analyzing trends for that area, generating draft candidates, editing drafts, recording rewrite requests for OpenClaw, inspecting what xsquared has learned about your writing style, and posting approved drafts through birdclaw compose post.
 
+Use [TweetClaw](https://github.com/Xquik-dev/tweetclaw) alongside xsquared when the task needs structured Xquik API-backed X/Twitter workflows outside the local Birdclaw draft loop:
+
+    openclaw plugins install @xquik/tweetclaw
+
+xsquared remains the local drafting, review, dashboard, and Birdclaw publishing workspace. TweetClaw is the companion OpenClaw plugin for scrape tweets, search tweets, search tweet replies, follower export, user lookup, media upload, media download, direct messages, monitor tweets, webhooks, giveaway draws, and approval-reviewed post tweets or post tweet replies through Xquik. The official npm package is [`@xquik/tweetclaw`](https://www.npmjs.com/package/@xquik/tweetclaw); use the [ClawHub page](https://clawhub.ai/plugins/@xquik/tweetclaw) for browsing plugin metadata while npm remains the canonical install source.
+
 The automatic content loop is intentionally simple for the first version:
 
 1. Save a posting area, such as "Google Ads for small business".
