@@ -419,6 +419,9 @@ function fetchFeedSnapshot(opts) {
   const args = ["--json", "search", "tweets", "--resource", resource, "--hide-low-quality", "--originals-only", "--limit", String(limit)];
   if (topic) args.push(topic);
   const result = birdclaw(args);
+  if (!result.ok && !result.stdout.trim()) {
+    throw new Error("Birdclaw feed fetch failed: " + (result.stderr.trim() || result.error || "command failed"));
+  }
   const rawItems = parseJsonLinesOrArray(result.stdout);
   const posts = rawItems.map(function(item) {
     return {
@@ -582,7 +585,11 @@ function generateFromFeed(body) {
   if (!selectedPosts.length) throw new Error("no posts selected");
   const count = Number(body.count || selectedPosts.length || 5);
   const latestProfile = store.profileSnapshots[0] || null;
-  const drafts = makeFeedInspiredTexts(selectedPosts, area, latestProfile, count).map(savePost);
+  const drafts = makeFeedInspiredTexts(selectedPosts, area, latestProfile, count).map(function(input) {
+    const post = normalizePost(input);
+    store.posts.unshift(post);
+    return post;
+  });
   const generation = {
     id: makeId("generation"),
     createdAt: nowIso(),
@@ -593,10 +600,9 @@ function generateFromFeed(body) {
     postIds: drafts.map(function(post) { return post.id; }),
     note: "Feed-inspired generation. Source: " + feedSnapshot.id + ". Ask OpenClaw to rewrite with your voice."
   };
-  const fresh = readStore();
-  fresh.generationSnapshots.unshift(generation);
-  fresh.generationSnapshots = fresh.generationSnapshots.slice(0, 50);
-  writeStore(fresh);
+  store.generationSnapshots.unshift(generation);
+  store.generationSnapshots = store.generationSnapshots.slice(0, 50);
+  writeStore(store);
   return { generation, feedSnapshot, posts: drafts };
 }
 
@@ -609,7 +615,11 @@ function generateFromDirection(body) {
   if (!direction) throw new Error("direction not found; create a direction first");
   const count = Number(body.count || 5);
   const latestProfile = store.profileSnapshots[0] || null;
-  const drafts = makeDirectionTexts(direction, latestProfile, count).map(savePost);
+  const drafts = makeDirectionTexts(direction, latestProfile, count).map(function(input) {
+    const post = normalizePost(input);
+    store.posts.unshift(post);
+    return post;
+  });
   const generation = {
     id: makeId("generation"),
     createdAt: nowIso(),
@@ -620,10 +630,9 @@ function generateFromDirection(body) {
     postIds: drafts.map(function(post) { return post.id; }),
     note: "Direction-based generation: " + direction.name + ". Ask OpenClaw to rewrite with your voice."
   };
-  const fresh = readStore();
-  fresh.generationSnapshots.unshift(generation);
-  fresh.generationSnapshots = fresh.generationSnapshots.slice(0, 50);
-  writeStore(fresh);
+  store.generationSnapshots.unshift(generation);
+  store.generationSnapshots = store.generationSnapshots.slice(0, 50);
+  writeStore(store);
   return { generation, direction, posts: drafts };
 }
 
