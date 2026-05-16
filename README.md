@@ -46,6 +46,8 @@ CLI:
     node dist/xsquared.js viral-fetch <source-id>                      # pull viral feed
     node dist/xsquared.js generate <source-id> --count 5               # 5 LLM drafts
     node dist/xsquared.js generate <source-id> --selected id1,id2      # viral: only these
+    node dist/xsquared.js auto-draft [source-id] --max-drafts 3        # fetch, rank, dedupe, draft
+    node dist/xsquared.js validate-draft <source-id> --text "..."     # grounding gate
     node dist/xsquared.js list [--source <source-id>] [--json]
     node dist/xsquared.js post <post-id>
     node dist/xsquared.js profile-learn --handle "@therealtongchen"
@@ -60,6 +62,16 @@ Env vars for the LLM pipeline:
 - `XSQUARED_CLAUDE_BIN` — override the `claude` binary path.
 
 The Posts tab groups drafts by Topic and Trending. It supports editing drafts, recording rewrite requests for OpenClaw, inspecting what xsquared has learned about your writing style, and posting approved drafts through birdclaw compose post.
+
+Hourly automation is installed as OpenClaw cron \`e4dff86f-e451-47cc-bfd6-2cc9b5f033ee\` (\`xsquared hourly viral auto-drafts\`). It runs \`npm run hourly-drafts\`, creates local drafts only, says \`NO_REPLY\` when no new qualifying posts are found, and reports in the Telegram x-growth topic only when drafts are created or the job fails.
+
+Viral drafts pass through a deterministic grounding validator before storage. High-risk claims like \`can now\`, launch claims, \`ready-to-post\`, workflow automation claims, and vague product promises are rejected unless the selected source post or source context supports them. Regression check: \`npm run validate:grounding\`.
+
+Auto-drafting has stricter production gates than dashboard feed browsing:
+
+- A viral source must have either a search filter or a relevance focus.
+- DeepSeek ranking must succeed before drafts are created.
+- Local heuristic ranking is allowed for displaying/debugging feed candidates, but auto-draft will skip it unless \`XSQUARED_ALLOW_LOCAL_RANK_AUTODRAFT=1\` is explicitly set.
 
 The sidebar includes an Eigen chat panel. It auto-detects the latest OpenClaw Telegram topic session and sends messages back into that session with `openclaw agent --session-id`; the UI stores its local transcript in `.xsquared/store.json`.
 

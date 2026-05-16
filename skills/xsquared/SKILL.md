@@ -62,6 +62,25 @@ For example: Google Ads for small business.
 
     node dist/xsquared.js trends --topic "<topic>" --limit 40 --json
 
+For automated viral-feed drafting:
+
+    node dist/xsquared.js auto-draft [source-id] --max-drafts 3 --min-score 75 --json
+
+This fetches the viral feed, ranks relevance/newsworthiness, dedupes source posts already used as inspiration, and creates local drafts only. It does not post to X.
+
+Auto-draft production gates:
+
+- Viral source must have a filter or relevance focus.
+- DeepSeek ranking must succeed; local heuristic ranker output is not trusted for auto-drafting unless \`XSQUARED_ALLOW_LOCAL_RANK_AUTODRAFT=1\`.
+- Generated drafts must pass grounding validation before storage.
+
+Generated viral drafts are validated before storage:
+
+    node dist/xsquared.js validate-draft <source-id> --text "<draft>" --json
+    npm run validate:grounding
+
+Reject unsupported product/workflow claims such as "can now", launch claims, "ready-to-post", "content plan", or automation claims unless grounded in the source post or explicit source context.
+
 5. Learn the user's writing style. The dashboard does this automatically; run manually only when you need to force-refresh:
 
     node dist/xsquared.js profile-learn --handle "@therealtongchen" --limit 200 --json
@@ -119,4 +138,4 @@ Only post after explicit approval:
 
     node dist/xsquared.js post <post-id>
 
-Posting uses birdclaw compose post with the selected post text. Default Birdclaw account is acct_primary.
+The dashboard posting button opens X's web composer intent URL with the selected post text prefilled. It does not publish server-side. If a draft has required media, the user must attach the generated/original image in X before posting. The CLI `post` command returns the same intent URL metadata.

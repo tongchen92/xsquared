@@ -6,6 +6,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
+import { buildGroundingEvidence, validateDraftBatch, validateDraftGrounding } from "./grounding.js";
+import { rankerTrustedForAutoDraft, requireViralContext, sourceHasExplicitViralFocus } from "./viralPolicy.js";
 
 const DEFAULT_ACCOUNT = process.env.XSQUARED_ACCOUNT || "acct_primary";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -16,11 +18,18 @@ const STORE_BACKUP_PATH = path.join(APP_DIR, "store.backup.json");
 const CLAUDE_BIN = process.env.XSQUARED_CLAUDE_BIN || "claude";
 const CLAUDE_MODEL = process.env.XSQUARED_CLAUDE_MODEL || "sonnet";
 const RESEARCH_BUDGET_USD = process.env.XSQUARED_RESEARCH_BUDGET_USD || "0.50";
+const DEEPSEEK_PRO_MODEL = process.env.XSQUARED_DEEPSEEK_PRO_MODEL || "deepseek/deepseek-v4-pro";
+const DEFAULT_RELEVANCE_FOCUS = process.env.XSQUARED_RELEVANCE_FOCUS || "AI, technology, Google Ads, automation, small business marketing, SaaS, operator workflows";
 const LOCAL_BIRDCLAW_BIN = path.join(PLUGIN_ROOT, "node_modules", ".bin", process.platform === "win32" ? "birdclaw.cmd" : "birdclaw");
 const LOCAL_BIRDCLAW_SCRIPT = path.join(PLUGIN_ROOT, "node_modules", "birdclaw", "bin", "birdclaw.mjs");
 const DEFAULT_PROFILE_HANDLE = process.env.XSQUARED_HANDLE || "@therealtongchen";
 const DEFAULT_PROFILE_LIMIT = process.env.XSQUARED_PROFILE_LIMIT || "200";
 const PROFILE_REFRESH_MS = Number(process.env.XSQUARED_PROFILE_REFRESH_MS || String(12 * 60 * 60 * 1000));
+const NO_CACHE_HEADERS = {
+  "cache-control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+  pragma: "no-cache",
+  expires: "0"
+};
 const BIRDCLAW_CANDIDATES = process.env.BIRDCLAW_BIN
   ? [process.env.BIRDCLAW_BIN]
   : [LOCAL_BIRDCLAW_BIN, LOCAL_BIRDCLAW_SCRIPT, "birdclaw"].filter(function(candidate, index, arr) {
@@ -96,7 +105,7 @@ function readStore() {
       name: "Viral feed",
       createdAt: nowIso(),
       updatedAt: nowIso(),
-      config: { filter: "", resource: "home", limit: 40 },
+      config: { filter: "", relevanceFocus: DEFAULT_RELEVANCE_FOCUS, resource: "home", limit: 40 },
       research: null,
       lastFeedSnapshot: null
     });
@@ -416,6 +425,18 @@ function callClaude(prompt, opts) {
   return run(CLAUDE_BIN, args, { timeout: opts.timeoutMs || 180000, maxBuffer: 32 * 1024 * 1024, input: prompt });
 }
 
+function parseClaudeEnvelope(result) {
+  const envelope = result && result.stdout && result.stdout.trim() ? safeJson(result.stdout.trim()) : null;
+  if (!envelope || typeof envelope !== "object") {
+    throw new Error("claude returned unparseable output: " + String((result && result.stdout) || "").slice(0, 500));
+  }
+  if (envelope.is_error) {
+    const detail = envelope.result || (Array.isArray(envelope.errors) ? envelope.errors.join("; ") : "") || "unknown error";
+    throw new Error("claude error: " + detail);
+  }
+  return envelope;
+}
+
 function extractFencedJson(text) {
   const raw = String(text || "");
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -447,7 +468,7 @@ function buildResearchPrompt(source) {
   const c = source.config || {};
   return [
     "You are doing background research for an X (Twitter) post about a specific topic.",
-    "Use the WebSearch and WebFetch tools to find 6-10 high-signal recent sources.",
+    "Use web_search and web_fetch to find 6-10 high-signal recent sources.",
     "",
     "Topic: " + source.name,
     "Angle / objective: " + (c.angle || "(none specified)"),
@@ -500,11 +521,63 @@ function buildTopicGenPrompt(source, profile, count) {
   ].filter(Boolean).join("\n");
 }
 
+function analyzeInspirationPost(post, sourceName) {
+  const text = String((post && post.text) || "").trim();
+  const lower = text.toLowerCase();
+  const firstLine = (text.split(/\n+/).find(function(line) { return line.trim(); }) || text).trim();
+  const sentences = text.split(/(?<=[.!?])\s+/).map(function(s) { return s.trim(); }).filter(Boolean);
+  const hasQuestion = /\?/.test(firstLine);
+  const hasList = /(^|\n)\s*(\d+\.|-|\*)/.test(text) || /\b(\d+)\s+(ways|rules|lessons|mistakes|things)\b/i.test(text);
+  const hasContrarian = /\b(not|wrong|myth|misses|truth|actually|counterintuitive|unpopular)\b/i.test(text);
+  const hasHowTo = /\b(how to|here'?s how|framework|playbook|step|checklist)\b/i.test(text);
+  const hasStory = /\b(i |we |my |our |learned|built|failed|tried)\b/i.test(lower);
+  const hookType = hasQuestion ? "question hook" : hasList ? "list hook" : hasContrarian ? "contrarian hook" : hasHowTo ? "how-to hook" : hasStory ? "story hook" : "direct claim hook";
+  const structure = hasList ? "list / enumerated points" : hasHowTo ? "problem -> framework -> action" : hasStory ? "personal observation -> lesson" : hasContrarian ? "common belief -> correction -> implication" : "claim -> reason -> takeaway";
+  const claim = sentences[0] || firstLine.slice(0, 180);
+  const mechanism = sentences.slice(1, 3).join(" ") || "The post creates tension quickly, then gives the reader a sharper way to think about the topic.";
+  const audiencePain = /small business|founder|operator|startup|agency|marketer|google ads|ads/i.test(text + " " + sourceName)
+    ? "operators want a practical version they can apply without extra theory"
+    : "readers want the useful lesson behind a viral claim, without copying the original take";
+  const rewriteBrief = [
+    "Use the " + hookType + " and " + structure + ".",
+    "Preserve the tension, but replace the example with " + sourceName + ".",
+    "Make the draft a standalone post in Tong's voice."
+  ].join(" ");
+  return { hookType, structure, claim, mechanism, audiencePain, rewriteBrief };
+}
+
+function sourceImagesForPost(post) {
+  return Array.isArray(post && post.images) ? post.images.filter(function(image) { return image && (image.url || image.thumbnailUrl); }) : [];
+}
+
+function buildMediaPlanFromSource(post, sourceName) {
+  const images = sourceImagesForPost(post);
+  if (!images.length) return null;
+  return {
+    required: true,
+    type: "image",
+    status: "needed",
+    brief: "Create an original image that carries the same job as the source media, adapted to " + sourceName + ". Do not reuse or copy the original image.",
+    sourceImages: images.slice(0, 4).map(function(image) {
+      return {
+        url: image.url || image.thumbnailUrl || "",
+        thumbnailUrl: image.thumbnailUrl || image.url || "",
+        altText: image.altText || "",
+        width: image.width || null,
+        height: image.height || null
+      };
+    })
+  };
+}
+
 function buildViralGenPrompt(sourceName, inspiration, profile, count) {
   const voice = profile ? summarizeProfileForPrompt(profile) : "(direct, no hype, ~140-200 chars)";
   const lines = [
-    "Draft " + count + " original X posts inspired by these recently-viral posts.",
-    "Each draft should respond to ONE inspiration post with the user's own angle - NOT a quote-tweet reply, but a standalone post that takes a position.",
+    "Draft " + count + " original X posts inspired by these selected viral/feed posts.",
+    "This is strategy extraction, not rewriting. Do NOT copy phrasing, sentence structure, jokes, or claims verbatim.",
+    "For each selected post, first infer why it worked, then create a standalone post in the user's voice.",
+    "Do not invent product capabilities, launches, integrations, or facts. If the source post says a tool can do X, do not transform it into a different tool doing Y unless the Topic context explicitly proves Y exists.",
+    "When the Topic context is vague, write an observation/take about the source's real market event instead of pretending xsquared/Claude/OpenClaw has a new feature.",
     "",
     "Topic context: " + sourceName,
     "",
@@ -518,9 +591,18 @@ function buildViralGenPrompt(sourceName, inspiration, profile, count) {
   lines.push("Voice profile:");
   lines.push(voice);
   lines.push("");
-  lines.push("Return JSON: { \"posts\": [ { \"text\": \"...\", \"angle\": \"...\", \"score\": 60-95, \"notes\": \"...\", \"inspirationIndex\": <1..N> } ] }");
+  lines.push("Return JSON inside a fenced json block:");
+  lines.push("{ \"posts\": [ { \"text\": \"...\", \"angle\": \"...\", \"score\": 60-95, \"notes\": \"why this draft should land\", \"inspirationIndex\": <1..N>, \"strategy\": { \"hookType\": \"...\", \"structure\": \"...\", \"claim\": \"...\", \"mechanism\": \"...\", \"audiencePain\": \"...\", \"rewriteBrief\": \"...\" } } ] }");
   lines.push("");
-  lines.push("Rules: same as before - <=280 chars, voice-matched, no hype.");
+  lines.push("Rules:");
+  lines.push("- One draft per selected inspiration post unless count requires fewer.");
+  lines.push("- Each draft <=280 chars.");
+  lines.push("- Make it about the Topic context, not about Twitter/X virality.");
+  lines.push("- Any concrete claim must be supported by the source post text or the Topic context.");
+  lines.push("- No fabricated 'can now', 'just launched', 'ready-to-post', or workflow claims.");
+  lines.push("- Use the user's voice profile and prior tweet samples; no generic creator-bro language.");
+  lines.push("- No hashtags unless the voice profile shows regular hashtag use.");
+  lines.push("- No emojis unless the voice profile shows them.");
   return lines.join("\n");
 }
 
@@ -540,7 +622,8 @@ function callLlmForDrafts(prompt, count) {
       score: Number(p && p.score) || 75,
       notes: String((p && p.notes) || ""),
       source: "xsquared-generator",
-      inspirationIndex: p && p.inspirationIndex
+      inspirationIndex: p && p.inspirationIndex,
+      strategy: p && p.strategy && typeof p.strategy === "object" ? p.strategy : null
     };
   }).filter(function(p) { return p.text; });
   // Attach cost/duration metadata.
@@ -554,17 +637,21 @@ function runResearch(sourceId) {
   if (!source) throw new Error("source not found: " + sourceId);
   if (source.kind !== "topic") throw new Error("research only valid for topic sources");
   const t0 = Date.now();
-  const r = callClaude(buildResearchPrompt(source), {
+  const result = callClaude(buildResearchPrompt(source), {
     allowTools: ["WebSearch", "WebFetch"],
     budgetUsd: RESEARCH_BUDGET_USD,
     timeoutMs: 240000
   });
-  if (!r.ok) throw new Error("claude failed: " + (r.stderr.trim() || r.error || "exit " + r.status));
-  const envelope = r.stdout.trim() ? safeJson(r.stdout.trim()) : null;
-  if (!envelope || typeof envelope !== "object") throw new Error("claude returned unparseable output");
-  if (envelope.is_error) throw new Error("claude error: " + (envelope.result || "unknown"));
+  if (!result.ok) {
+    const detail = (result.stderr || result.stdout || result.error || "exit " + result.status).trim();
+    throw new Error("research failed: " + detail.slice(0, 1000));
+  }
+  const envelope = parseClaudeEnvelope(result);
   const rawText = String(envelope.result || "");
   const parsed = extractFencedJson(rawText) || {};
+  if (!parsed || typeof parsed !== "object" || (!Array.isArray(parsed.links) && !Array.isArray(parsed.summaries) && !Array.isArray(parsed.facts))) {
+    throw new Error("research agent returned invalid JSON: " + String(rawText || "").slice(0, 1000));
+  }
   const links = Array.isArray(parsed.links) ? parsed.links.slice(0, 12).map(function(link) {
     return {
       url: String((link && link.url) || ""),
@@ -583,6 +670,7 @@ function runResearch(sourceId) {
     facts: Array.isArray(parsed.facts) ? parsed.facts.slice(0, 20).map(String) : [],
     raw: rawCapped,
     costUsd: Number(envelope.total_cost_usd || 0),
+    transport: "claude-cli",
     durationMs: Date.now() - t0
   };
   const s2 = readStore();
@@ -592,6 +680,110 @@ function runResearch(sourceId) {
   src.updatedAt = nowIso();
   writeStore(s2);
   return artifact;
+}
+
+function usedInspirationIds(store, sourceId) {
+  const ids = new Set();
+  for (const post of store.posts || []) {
+    if (sourceId && post.sourceId !== sourceId) continue;
+    for (const insp of post.inspirationPosts || []) {
+      if (insp && insp.id) ids.add(String(insp.id));
+    }
+  }
+  return ids;
+}
+
+function qualifiesForAutoDraft(post, minScore) {
+  const r = post.relevance || {};
+  const score = Number(r.score || 0);
+  const repostability = Number(r.repostability || 0);
+  return score >= minScore &&
+    repostability >= 62 &&
+    r.personalOrContextLocked !== true &&
+    r.firstPartySelfPost !== true &&
+    (r.newsworthy !== false || r.insightRich === true);
+}
+
+function autoDraftViral(input) {
+  input = input || {};
+  const maxDrafts = Math.min(10, Math.max(1, Number(input.maxDrafts || 3)));
+  const minScore = Math.min(100, Math.max(0, Number(input.minScore || 75)));
+  const targetSourceId = input.sourceId ? String(input.sourceId) : "";
+  const store = readStore();
+  const sources = store.sources.filter(function(source) {
+    return source.kind === "viral" && (!targetSourceId || source.id === targetSourceId);
+  });
+  if (targetSourceId && !sources.length) throw new Error("viral source not found: " + targetSourceId);
+  const results = [];
+  let totalDrafted = 0;
+  for (const source of sources) {
+    if (!sourceHasExplicitViralFocus(source)) {
+      results.push({
+        sourceId: source.id,
+        sourceName: source.name,
+        fetched: 0,
+        qualified: 0,
+        drafted: 0,
+        reason: "viral source needs a filter or relevance focus before auto-drafting"
+      });
+      continue;
+    }
+    const snapshot = viralFetch(source.id);
+    if (!rankerTrustedForAutoDraft(snapshot.ranker) && process.env.XSQUARED_ALLOW_LOCAL_RANK_AUTODRAFT !== "1") {
+      results.push({
+        sourceId: source.id,
+        sourceName: source.name,
+        fetched: snapshot.rawSampleCount || 0,
+        ranked: snapshot.sampleCount || 0,
+        qualified: 0,
+        drafted: 0,
+        reason: "ranker was not trusted for auto-drafting",
+        ranker: snapshot.ranker || null
+      });
+      continue;
+    }
+    const afterFetch = readStore();
+    const used = usedInspirationIds(afterFetch, source.id);
+    const candidates = (snapshot.posts || []).filter(function(post) {
+      return post && post.id && !used.has(String(post.id)) && qualifiesForAutoDraft(post, minScore);
+    }).slice(0, maxDrafts);
+    if (!candidates.length) {
+      results.push({
+        sourceId: source.id,
+        sourceName: source.name,
+        fetched: snapshot.rawSampleCount || 0,
+        qualified: 0,
+        drafted: 0,
+        reason: "no new qualifying posts"
+      });
+      continue;
+    }
+    const generated = generateForSource(source.id, {
+      count: candidates.length,
+      selectedPostIds: candidates.map(function(post) { return post.id; })
+    });
+    totalDrafted += (generated.posts || []).length;
+    results.push({
+      sourceId: source.id,
+      sourceName: source.name,
+      fetched: snapshot.rawSampleCount || 0,
+      ranked: snapshot.sampleCount || 0,
+      qualified: candidates.length,
+      drafted: (generated.posts || []).length,
+      rejected: (generated.rejectedDrafts || []).length,
+      postIds: (generated.posts || []).map(function(post) { return post.id; }),
+      costUsd: generated.costUsd || 0,
+      durationMs: generated.durationMs || 0
+    });
+  }
+  return {
+    createdAt: nowIso(),
+    sourceCount: sources.length,
+    totalDrafted,
+    minScore,
+    maxDrafts,
+    results
+  };
 }
 
 // Adapter so the template fallback keeps working unchanged.
@@ -643,6 +835,240 @@ function mapBirdItems(items) {
   }).filter(function(p) { return p.text; });
 }
 
+function buildFeedRankPrompt(posts, focus) {
+  const payload = {
+    focus,
+    criteria: {
+      relevance: "Prioritize AI, technology, Google Ads, automation, SaaS, and practical business/operator content.",
+      newsworthiness: "Must be tied to a product launch, market shift, platform change, measurable data point, public company move, widely relevant tactic, sharp market comparison, monetization insight, or clear industry insight.",
+      repostability: "Can Tong create a smart original take from this without copying, dunking, reacting to drama, needing the reader to know the original poster, or effectively commenting on the original poster's own business?",
+      quality: "Prefer concrete claims, data, product/business insight, strong hooks, useful charts/images, and non-generic lessons.",
+      hardReject: "Reject deeply personal updates, private milestones, personal anecdotes with no broader lesson, one-person context, first-party startup/company updates where the author is the subject, vague motivation, memes, celebrity/news chatter, politics, and engagement bait.",
+      downrank: "Downrank posts that are merely interesting but not actionable, insight-rich, or reusable for Tong's audience."
+    },
+    posts: posts.slice(0, 60).map(function(p, i) {
+      return {
+        index: i + 1,
+        id: p.id || String(i + 1),
+        author: p.author || null,
+        text: String(p.text || "").slice(0, 1000),
+        url: p.url || p.tweetUrl || null,
+        hasImage: Array.isArray(p.images) && p.images.length > 0,
+        likeCount: p.likeCount || 0,
+        retweetCount: p.retweetCount || 0,
+        replyCount: p.replyCount || 0
+      };
+    })
+  };
+  return [
+    "You are ranking X/Twitter feed posts for xsquared.",
+    "Goal: choose posts Tong can use as high-quality inspiration for original X posts.",
+    "Return JSON only. Do not write prose outside JSON.",
+    "",
+    "Score each post from 0-100 using these gates:",
+    "- 90-100: directly relevant, broadly reusable, and strong inspiration",
+    "- 75-89: relevant, insight-rich, and usable",
+    "- 55-74: maybe relevant, but weak or not clearly reusable",
+    "- under 55: noise for this workflow",
+    "",
+    "Hard rule: if a post is mostly personal to the author or depends on the author's private context, score it under 55 even if it has high engagement.",
+    "Hard rule: if the author or company is posting about their own startup/product/team/shutdown/growth/pricing/results, score it under 60 unless it is a major public platform announcement with broad third-party impact.",
+    "Prefer third-party analysis, commentary, benchmarks, comparisons, and public market observations over first-party founder/company updates.",
+    "Hard rule: if a post is relevant but neither newsworthy nor a reusable industry/business insight, score it under 70.",
+    "Important: public market comparisons, revenue comparisons, model-company strategy, pricing/monetization observations, and AI adoption data can score highly even when they are not breaking news.",
+    "",
+    "Output shape:",
+    "{ \"rankings\": [{ \"id\": \"post id\", \"score\": 88, \"repostability\": 82, \"newsworthy\": true, \"insightRich\": true, \"firstPartySelfPost\": false, \"personalOrContextLocked\": false, \"category\": \"AI|Tech|Google Ads|Marketing|SaaS|Other\", \"reason\": \"short reason\", \"useAs\": \"what angle Tong could take\" }] }",
+    "",
+    "Input:",
+    JSON.stringify(payload, null, 2)
+  ].join("\n");
+}
+
+function localFeedCandidateScore(post, focus) {
+  const text = (String(post.text || "") + " " + String(post.authorName || "") + " " + String(post.author || "")).toLowerCase();
+  const strongTerms = ["ai", "agent", "agents", "claude", "chatgpt", "openai", "anthropic", "openclaw", "codex", "deepseek", "google ads", "google", "ads", "adwords", "ppc", "seo", "saas", "automation", "workflow", "startup", "founder", "conversion", "marketing", "search", "gemini"];
+  const newsTerms = ["launched", "launch", "released", "release", "announced", "ships", "shipped", "new", "now", "report", "data", "revenue", "monetize", "monetization", "growth", "benchmark", "study", "comparison", "vs", "despite", "fewer users", "users than", "integration", "api", "model", "product", "platform", "pricing", "acquired", "funding", "rolled out"];
+  const weakBadTerms = ["football", "basketball", "movie", "celebrity", "dating", "politics", "election", "war", "weather"];
+  const personalTerms = ["my wife", "my husband", "my kid", "my son", "my daughter", "my family", "my friend", "i'm happy", "i am happy", "proud to", "my journey", "i got", "i was lucky", "i just", "personal update"];
+  const firstPartyTerms = ["we're a ", "we are a ", "our stack", "our entire stack", "we built", "we launched", "we shipped", "we're launching", "we are launching", "we made the decision", "we've made the decision", "is winding down", "we're winding down", "we are winding down", "our product", "our users", "our startup", "our company", "our team", "we raised", "we grew"];
+  let score = 0;
+  strongTerms.forEach(function(term) {
+    if (text.includes(term)) score += term.includes(" ") ? 18 : 10;
+  });
+  newsTerms.forEach(function(term) {
+    if (text.includes(term)) score += 6;
+  });
+  weakBadTerms.forEach(function(term) {
+    if (text.includes(term)) score -= 14;
+  });
+  personalTerms.forEach(function(term) {
+    if (text.includes(term)) score -= 24;
+  });
+  firstPartyTerms.forEach(function(term) {
+    if (text.includes(term)) score -= 28;
+  });
+  const engagement = (Number(post.likeCount) || 0) + (Number(post.retweetCount) || 0) * 3 + (Number(post.replyCount) || 0) * 2;
+  score += Math.min(25, Math.log10(engagement + 1) * 8);
+  if (Array.isArray(post.images) && post.images.length) score += 4;
+  if (String(post.text || "").length > 80) score += 4;
+  return score;
+}
+
+function localRelevanceForPost(post, focus) {
+  const rawText = String(post.text || "");
+  const text = (rawText + " " + String(post.authorName || "") + " " + String(post.author || "")).toLowerCase();
+  const newsworthy = /\b(launched|launch|released|release|announced|ships|shipped|new|report|data|revenue|monetiz|growth|benchmark|study|comparison|vs|despite|fewer users|integration|api|model|platform|pricing|acquired|funding|rolled out)\b/i.test(rawText);
+  const insightRich = /\b(why|how|because|means|lesson|playbook|framework|benchmark|data|revenue|monetiz|margin|conversion|search terms|quality score|cac|roas|cpa)\b/i.test(rawText);
+  const personalOrContextLocked = /\b(my wife|my husband|my kid|my son|my daughter|my family|my friend|my journey|personal update|i got|i was lucky|proud to)\b/i.test(text);
+  const firstPartySelfPost = /\b(we're a|we are a|we built|we launched|we shipped|we're launching|we are launching|we've made the decision|we made the decision|is winding down|we're winding down|we are winding down|our product|our users|our startup|our company|our team|we raised|we grew)\b/i.test(text);
+  const category = /google ads|adwords|ppc|search terms|roas|cpa/.test(text) ? "Google Ads"
+    : /marketing|seo|conversion|growth/.test(text) ? "Marketing"
+    : /saas|startup|founder/.test(text) ? "SaaS"
+    : /ai|agent|claude|chatgpt|openai|anthropic|deepseek|gemini|model/.test(text) ? "AI"
+    : /api|platform|tech|developer|code/.test(text) ? "Tech"
+    : "Other";
+  let score = Math.round(localFeedCandidateScore(post, focus));
+  if (newsworthy) score += 10;
+  if (insightRich) score += 8;
+  if (personalOrContextLocked) score -= 25;
+  if (firstPartySelfPost) score -= 22;
+  score = Math.max(0, Math.min(100, score));
+  const repostability = Math.max(0, Math.min(100, score - (firstPartySelfPost ? 18 : 0) - (personalOrContextLocked ? 18 : 0)));
+  return {
+    score,
+    repostability,
+    newsworthy,
+    insightRich,
+    firstPartySelfPost,
+    personalOrContextLocked,
+    category,
+    reason: newsworthy || insightRich ? "Local fallback: relevant and broadly reusable." : "Local fallback: relevant terms found, but weak news/insight signal.",
+    useAs: category === "Google Ads" ? "Practical operator take on Google Ads or paid search." : category + " operator take."
+  };
+}
+
+function localRankFeed(posts, focus, extraMeta) {
+  const candidates = prefilterFeedCandidates(posts, focus).map(function(p) {
+    return { ...p, relevance: localRelevanceForPost(p, focus) };
+  }).sort(function(a, b) {
+    const as = (a.relevance && a.relevance.score) || 0;
+    const bs = (b.relevance && b.relevance.score) || 0;
+    if (bs !== as) return bs - as;
+    return ((b.likeCount || 0) + (b.retweetCount || 0) * 3 + (b.replyCount || 0) * 2) - ((a.likeCount || 0) + (a.retweetCount || 0) * 3 + (a.replyCount || 0) * 2);
+  });
+  const curated = candidates.filter(function(p) {
+    const r = p.relevance || {};
+    return r.score >= 78 && r.repostability >= 75 && r.newsworthy === true && r.insightRich === true && r.personalOrContextLocked !== true && r.firstPartySelfPost !== true;
+  }).slice(0, 40);
+  return {
+    posts: curated,
+    meta: {
+      model: "local-heuristic",
+      focus,
+      inputCount: posts.length,
+      rankedCandidateCount: candidates.length,
+      outputCount: curated.length,
+      droppedCount: Math.max(0, posts.length - curated.length),
+      ...(extraMeta || {})
+    }
+  };
+}
+
+function prefilterFeedCandidates(posts, focus) {
+  const max = Math.min(posts.length, Math.max(10, Number(process.env.XSQUARED_DEEPSEEK_RANK_LIMIT || 24)));
+  return posts.map(function(post, index) {
+    return { post, index, score: localFeedCandidateScore(post, focus) };
+  }).sort(function(a, b) {
+    return b.score - a.score || a.index - b.index;
+  }).slice(0, max).map(function(item) { return item.post; });
+}
+
+function rankFeedWithDeepSeek(posts, focus) {
+  if (!posts.length) return { posts, meta: { model: DEEPSEEK_PRO_MODEL, skipped: true, reason: "empty feed" } };
+  if (process.env.XSQUARED_DISABLE_DEEPSEEK_RANKER === "1") {
+    return localRankFeed(posts, focus, { skippedDeepSeek: true, reason: "XSQUARED_DISABLE_DEEPSEEK_RANKER=1" });
+  }
+  const candidates = prefilterFeedCandidates(posts, focus);
+  const started = Date.now();
+  const result = openclaw([
+    "agent",
+    "--local",
+    "--agent", "main",
+    "--model", DEEPSEEK_PRO_MODEL,
+    "--timeout", "120",
+    "--message", buildFeedRankPrompt(candidates, focus),
+    "--json"
+  ], 135000);
+  if (!result.ok) {
+    return localRankFeed(posts, focus, {
+      fallbackReason: "DeepSeek feed ranking failed",
+      deepSeekError: (result.stderr || result.stdout || result.error || "unknown error").trim().slice(0, 1000),
+      durationMs: Date.now() - started
+    });
+  }
+  const reply = extractAgentReply(result.stdout) || result.stdout;
+  const parsed = extractFencedJson(reply);
+  const rankings = parsed && Array.isArray(parsed.rankings) ? parsed.rankings : [];
+  if (!rankings.length) {
+    return localRankFeed(posts, focus, {
+      fallbackReason: "DeepSeek feed ranking returned no rankings",
+      deepSeekReply: String(reply || "").slice(0, 500),
+      durationMs: Date.now() - started
+    });
+  }
+  const byId = new Map();
+  rankings.forEach(function(r) {
+    if (!r || !r.id) return;
+    byId.set(String(r.id), {
+      score: Math.max(0, Math.min(100, Number(r.score) || 0)),
+      repostability: Math.max(0, Math.min(100, Number(r.repostability) || 0)),
+      newsworthy: r.newsworthy !== false,
+      insightRich: r.insightRich === true,
+      firstPartySelfPost: r.firstPartySelfPost === true,
+      personalOrContextLocked: r.personalOrContextLocked === true,
+      category: String(r.category || "Other"),
+      reason: String(r.reason || "").slice(0, 220),
+      useAs: String(r.useAs || "").slice(0, 220)
+    });
+  });
+  const ranked = candidates.map(function(p, index) {
+    const relevance = byId.get(String(p.id || index + 1)) || {
+      score: 0,
+      repostability: 0,
+      newsworthy: false,
+      insightRich: false,
+      firstPartySelfPost: true,
+      personalOrContextLocked: true,
+      category: "Other",
+      reason: "Not ranked by DeepSeek.",
+      useAs: ""
+    };
+    return { ...p, relevance };
+  }).sort(function(a, b) {
+    const as = (a.relevance && a.relevance.score) || 0;
+    const bs = (b.relevance && b.relevance.score) || 0;
+    if (bs !== as) return bs - as;
+    return ((b.likeCount || 0) + (b.retweetCount || 0) * 3 + (b.replyCount || 0) * 2) - ((a.likeCount || 0) + (a.retweetCount || 0) * 3 + (a.replyCount || 0) * 2);
+  });
+  const curated = ranked.filter(function(p) {
+    const r = p.relevance || {};
+    return r.score >= 68 && r.repostability >= 62 && (r.newsworthy !== false || r.insightRich === true) && r.personalOrContextLocked !== true && r.firstPartySelfPost !== true;
+  }).slice(0, 40);
+  return {
+    posts: curated,
+    meta: {
+      model: DEEPSEEK_PRO_MODEL,
+      focus,
+      durationMs: Date.now() - started,
+      inputCount: posts.length,
+      rankedCandidateCount: candidates.length,
+      outputCount: curated.length,
+      droppedCount: Math.max(0, posts.length - curated.length)
+    }
+  };
+}
+
 const BIRD_BIN = process.env.BIRD_BIN || "bird";
 function bird(args, timeoutMs = 30000) { return run(BIRD_BIN, args, { timeout: timeoutMs }); }
 function birdAuthStatus() {
@@ -689,16 +1115,21 @@ function viralFetch(sourceId) {
   if (!Array.isArray(items)) {
     throw new Error("Unexpected response from bird (not an array). First 200 chars: " + String(result.stdout).slice(0, 200));
   }
-  const posts = mapBirdItems(items);
+  const rawPosts = mapBirdItems(items);
+  const relevanceFocus = String(c.relevanceFocus || c.filter || DEFAULT_RELEVANCE_FOCUS).trim();
+  const rankedFeed = rankFeedWithDeepSeek(rawPosts, relevanceFocus);
   const snapshot = {
     id: makeId("feed"),
     createdAt: nowIso(),
     filter,
+    relevanceFocus,
     resource,
     limit,
     transport: { tool: "bird", endpoint: endpointLabel, ok: result.ok, status: result.status, error: result.error, stderr: result.stderr.trim() },
-    sampleCount: posts.length,
-    posts: posts.slice(0, 60)
+    ranker: rankedFeed.meta,
+    rawSampleCount: rawPosts.length,
+    sampleCount: rankedFeed.posts.length,
+    posts: rankedFeed.posts
   };
   const s2 = readStore();
   const src = s2.sources.find(function(s) { return s.id === sourceId; });
@@ -747,14 +1178,15 @@ function generateForSource(sourceId, opts) {
       : snap.posts.slice(0, count);
     if (!selected.length) throw new Error("no posts selected");
     const need = selected.length;
-    const inputs = callLlmForDrafts(buildViralGenPrompt(source.name, selected, profile, need), need);
+    const viralContext = requireViralContext(source);
+    const inputs = callLlmForDrafts(buildViralGenPrompt(viralContext, selected, profile, need), need);
     let arr;
     if (inputs && inputs.length) {
       llmUsed = true;
       meta = inputs._meta || null;
       arr = inputs;
     } else {
-      arr = makeFeedInspiredTexts(selected, source.name, profile, need);
+      throw new Error("Claude feed generation returned no usable drafts.");
     }
     arr.forEach(function(p, i) {
       p.sourceId = source.id;
@@ -766,12 +1198,17 @@ function generateForSource(sourceId, opts) {
       })();
       if (insp) {
         p.inspirationPosts = [{ id: insp.id, author: insp.author, text: String(insp.text || "").slice(0, 200), url: insp.url }];
+        p.inspirationAnalysis = p.strategy || analyzeInspirationPost(insp, viralContext);
+        p._groundingEvidence = buildGroundingEvidence(source, viralContext, insp);
+        const mediaPlan = buildMediaPlanFromSource(insp, viralContext);
+        if (mediaPlan) p.media = { ...(mediaPlan || {}), ...((p.media && typeof p.media === "object") ? p.media : {}) };
       }
-      if (!p.topic) p.topic = source.name;
+      if (!p.topic) p.topic = viralContext;
     });
     drafts = arr;
   }
-  const finalDrafts = drafts.map(normalizePost);
+  const validation = validateDraftBatch(drafts, nowIso);
+  const finalDrafts = validation.accepted.map(normalizePost);
   const s2 = readStore();
   finalDrafts.forEach(function(d) { s2.posts.unshift(d); });
   s2.generationSnapshots.unshift({
@@ -782,6 +1219,8 @@ function generateForSource(sourceId, opts) {
     profileSnapshotId: profile ? profile.id : null,
     postIds: finalDrafts.map(function(d) { return d.id; }),
     count: finalDrafts.length,
+    rejectedCount: validation.rejected.length,
+    rejectedDrafts: validation.rejected.slice(0, 10),
     llmUsed,
     costUsd: meta ? meta.costUsd : 0,
     durationMs: meta ? meta.durationMs : 0
@@ -791,7 +1230,7 @@ function generateForSource(sourceId, opts) {
   const src2 = s2.sources.find(function(s) { return s.id === sourceId; });
   if (src2) src2.updatedAt = nowIso();
   writeStore(s2);
-  return { source: src2 || source, posts: finalDrafts, llmUsed, costUsd: meta ? meta.costUsd : 0, durationMs: meta ? meta.durationMs : 0 };
+  return { source: src2 || source, posts: finalDrafts, rejectedDrafts: validation.rejected, llmUsed, costUsd: meta ? meta.costUsd : 0, durationMs: meta ? meta.durationMs : 0 };
 }
 
 function listSources(filterKind) {
@@ -826,6 +1265,7 @@ function createSource(input) {
     const resource = ["home", "following", "for-you"].indexOf(config.resource) !== -1 ? config.resource : "home";
     normalizedConfig = {
       filter: String(config.filter || "").trim(),
+      relevanceFocus: String(config.relevanceFocus || "").trim(),
       resource,
       limit
     };
@@ -859,6 +1299,7 @@ function updateSource(id, updates) {
       if (updates.config.useTweetVoice !== undefined) c.useTweetVoice = Boolean(updates.config.useTweetVoice);
     } else {
       if (updates.config.filter !== undefined) c.filter = String(updates.config.filter || "").trim();
+      if (updates.config.relevanceFocus !== undefined) c.relevanceFocus = String(updates.config.relevanceFocus || "").trim();
       if (updates.config.resource !== undefined && ["home", "following", "for-you"].indexOf(updates.config.resource) !== -1) c.resource = updates.config.resource;
       if (updates.config.limit !== undefined) {
         let lim = Number(updates.config.limit);
@@ -996,9 +1437,15 @@ function resolveOpenClawSession() {
 function extractAgentReply(stdout) {
   const trimmed = String(stdout || "").replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "").trim();
   if (!trimmed) return "";
-  const parsed: any = safeJson(trimmed);
+  let parsed: any = safeJson(trimmed);
+  if (!parsed || typeof parsed !== "object") parsed = extractFencedJson(trimmed);
   if (parsed && typeof parsed === "object") {
-    return String(parsed.reply || parsed.response || parsed.message || parsed.output || parsed.text || parsed.result?.reply || parsed.result?.message || parsed.result?.text || trimmed);
+    if (Array.isArray(parsed.payloads) && parsed.payloads.length) {
+      return parsed.payloads.map(function(payload) {
+        return String((payload && (payload.text || payload.message || payload.content)) || "");
+      }).filter(Boolean).join("\n");
+    }
+    return String(parsed.reply || parsed.response || parsed.message || parsed.output || parsed.text || parsed.finalAssistantVisibleText || parsed.finalAssistantRawText || parsed.result?.reply || parsed.result?.message || parsed.result?.text || trimmed);
   }
   return trimmed;
 }
@@ -1117,6 +1564,7 @@ function makeFeedInspiredTexts(selectedPosts, area, profileSnapshot, count) {
     "The advantage in " + channel + " is not the channel itself. It is having cleaner data than competitors who are guessing."
   ];
   return selectedPosts.slice(0, Number(count) || 5).map(function(post, index) {
+    const analysis = analyzeInspirationPost(post, topic);
     const angle = angles[index % angles.length];
     const prefix = prefixes[index % prefixes.length];
     const body = bodies[index % bodies.length];
@@ -1125,13 +1573,15 @@ function makeFeedInspiredTexts(selectedPosts, area, profileSnapshot, count) {
     const trimmed = compact && text.length > 230 ? text.slice(0, 227).replace(/\s+\S*$/, "") + "..." : text;
     return {
       topic,
-      angle,
+      angle: analysis.hookType || angle,
       score: Math.max(70, 85 - index * 2),
       text: trimmed,
-      notes: "Inspired by trending post: " + postSnippet + (post.url ? " — " + post.url : ""),
+      notes: "Pattern extracted: " + analysis.structure + ". Inspired by: " + postSnippet + (post.url ? " - " + post.url : ""),
       source: "xsquared-generator",
       generationSource: "trending",
       inspirationPosts: [{ id: post.id, author: post.author, text: String(post.text || "").slice(0, 200), url: post.url }],
+      inspirationAnalysis: analysis,
+      media: buildMediaPlanFromSource(post, topic),
       directionId: null
     };
   });
@@ -1192,6 +1642,9 @@ function normalizePost(input) {
     source: input.source || "openclaw",
     generationSource: input.generationSource || input.source || "openclaw",
     inspirationPosts: input.inspirationPosts || [],
+    inspirationAnalysis: input.inspirationAnalysis || null,
+    groundingValidation: input.groundingValidation || null,
+    media: input.media || null,
     sourceId: input.sourceId || null,
     directionId: input.directionId || null,
     postedAt: input.postedAt || null,
@@ -1205,6 +1658,27 @@ function savePost(input) {
   store.posts.unshift(post);
   writeStore(store);
   return post;
+}
+
+function validateDraftCommand(sourceId, input) {
+  const store = readStore();
+  const source = store.sources.find(function(s) { return s.id === sourceId; });
+  if (!source) throw new Error("source not found: " + sourceId);
+  if (source.kind !== "viral") throw new Error("validate-draft currently validates viral sources only");
+  const text = String(input.text || "").trim();
+  if (!text) throw new Error("text is required");
+  const snap = source.lastFeedSnapshot || {};
+  const inspirationId = String(input.inspirationId || "");
+  const inspiration = inspirationId && Array.isArray(snap.posts) ? snap.posts.find(function(p) { return String(p.id) === inspirationId; }) : null;
+  if (inspirationId && !inspiration) throw new Error("inspiration not found in latest feed snapshot: " + inspirationId);
+  const context = requireViralContext(source);
+  const draft = {
+    text,
+    generationSource: "viral",
+    inspirationPosts: inspiration ? [{ id: inspiration.id, author: inspiration.author, text: String(inspiration.text || "").slice(0, 200), url: inspiration.url }] : [],
+    _groundingEvidence: buildGroundingEvidence(source, context, inspiration)
+  };
+  return validateDraftGrounding(draft);
 }
 
 function findPost(store, postId) {
@@ -1245,22 +1719,107 @@ function importJson(filePath) {
   return rows.map(savePost);
 }
 
+function xIntentUrl(text) {
+  return "https://x.com/intent/tweet?text=" + encodeURIComponent(String(text || "").slice(0, 280));
+}
+
 function postToX(postId, account) {
   const store = readStore();
   const post = findPost(store, postId);
-  const result = birdclaw(["--json", "compose", "post", "--account", account || DEFAULT_ACCOUNT, post.text]);
-  const payload: any = result.stdout.trim() ? safeJson(result.stdout.trim()) : null;
-  const transport = payload && typeof payload === "object" ? payload.transport : null;
-  const liveOk = result.ok && (!transport || transport.ok !== false);
+  const intentUrl = xIntentUrl(post.text);
   post.updatedAt = nowIso();
-  post.postResult = { at: nowIso(), account: account || DEFAULT_ACCOUNT, ok: liveOk, status: result.status, stdout: result.stdout.trim(), stderr: result.stderr.trim(), error: result.error, transport };
-  if (liveOk) {
-    post.status = "posted";
-    post.postedAt = nowIso();
-  } else {
-    post.status = "post_failed";
-    if (transport && transport.output) post.postResult.error = transport.output;
+  post.postResult = {
+    at: nowIso(),
+    account: account || DEFAULT_ACCOUNT,
+    ok: true,
+    mode: "x-intent",
+    intentUrl,
+    mediaRequired: Boolean(post.media && post.media.required),
+    note: post.media && post.media.required ? "X intent can prefill text only; attach the image manually before posting." : "Opened X composer with prefilled text."
+  };
+  writeStore(store);
+  return { ...post, intentUrl, mediaRequired: Boolean(post.media && post.media.required) };
+}
+
+function buildRewritePrompt(post, instruction, profile) {
+  const voice = profile ? summarizeProfileForPrompt(profile) : "(no learned voice - use a direct, practical operator voice)";
+  const inspiration = post.inspirationAnalysis ? JSON.stringify(post.inspirationAnalysis, null, 2) : "(none)";
+  return [
+    "Internal xsquared rewrite job. Do not post externally. Do not modify files.",
+    "Rewrite this X draft immediately. Return JSON only.",
+    "",
+    "Current draft:",
+    String(post.text || ""),
+    "",
+    "Instruction:",
+    String(instruction || "").trim() || "Make it sharper, clearer, and more specific.",
+    "",
+    "Context:",
+    "- topic: " + (post.topic || "(none)"),
+    "- angle: " + (post.angle || "(none)"),
+    "- generation source: " + (post.generationSource || post.source || "(unknown)"),
+    "",
+    "Voice profile:",
+    voice,
+    "",
+    "Inspiration analysis, if any:",
+    inspiration,
+    "",
+    "Output contract:",
+    "{ \"text\": \"rewritten post\", \"notes\": \"short reason for the rewrite\" }",
+    "",
+    "Rules:",
+    "- Keep the post <= 280 characters.",
+    "- Preserve the core idea unless the instruction says otherwise.",
+    "- Make the post sound like Tong: practical, direct, operator-minded.",
+    "- No hashtags or emojis unless already strongly implied by the draft.",
+    "- Do not include prose outside the JSON."
+  ].join("\n");
+}
+
+function callOpenClawForRewrite(post, instruction, profile) {
+  if (process.env.XSQUARED_DISABLE_OPENCLAW_REWRITE === "1") return null;
+  const result = openclaw([
+    "agent",
+    "--local",
+    "--agent", "main",
+    "--message", buildRewritePrompt(post, instruction, profile),
+    "--json"
+  ], 180000);
+  if (!result.ok) {
+    throw new Error((result.stderr || result.stdout || result.error || "OpenClaw rewrite failed").trim());
   }
+  const reply = extractAgentReply(result.stdout) || result.stdout;
+  const parsed = extractFencedJson(reply);
+  const text = String((parsed && parsed.text) || "").trim();
+  if (!text) throw new Error("OpenClaw rewrite returned no text");
+  return {
+    text: text.slice(0, 280),
+    notes: String((parsed && parsed.notes) || "").trim(),
+    raw: reply
+  };
+}
+
+function rewritePostNow(postId, instruction) {
+  const store = readStore();
+  const post = findPost(store, postId);
+  const originalText = String(post.text || "");
+  const profile = store.profileSnapshots[0] || null;
+  const rewritten = callOpenClawForRewrite(post, instruction, profile);
+  if (!rewritten) throw new Error("rewrite generator is disabled");
+  post.text = rewritten.text;
+  post.status = "draft";
+  post.updatedAt = nowIso();
+  post.notes = rewritten.notes || post.notes || "";
+  post.rewriteHistory ||= [];
+  post.rewriteHistory.unshift({
+    at: post.updatedAt,
+    instruction: String(instruction || "").trim() || "Improve this post.",
+    originalText,
+    rewrittenText: rewritten.text,
+    notes: rewritten.notes || ""
+  });
+  post.rewriteHistory = post.rewriteHistory.slice(0, 10);
   writeStore(store);
   return post;
 }
@@ -1301,6 +1860,7 @@ function html() {
   const CSS = ":root{color-scheme:light dark;--bg:#FAFAF7;--panel:#FFFFFF;--ink:#0A0A0A;--muted:#6B6B6B;--line:#E5E4DE;--accent:#B8542A;--accent-soft:#F2E3D9;--success:#15803D;--error:#B42318;--info:#1F4E8C;--r-sm:4px;--r-md:6px;--r-lg:8px;--shadow-1:0 1px 0 rgba(10,10,10,.03);--shadow-2:0 12px 30px rgba(10,10,10,.12);--font-ui:'Geist','Geist Sans',ui-sans-serif,system-ui,sans-serif;--font-display:'Fraunces',Georgia,serif;--font-mono:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}@media (prefers-color-scheme:dark){:root{--bg:#0E0E0C;--panel:#161614;--ink:#F5F5F0;--muted:#A3A3A0;--line:#2A2A26;--accent:#C56A3F;--accent-soft:#2A1B14;--shadow-1:0 1px 0 rgba(0,0,0,.4);--shadow-2:0 12px 30px rgba(0,0,0,.5)}}*{box-sizing:border-box}body{margin:0;padding-bottom:96px;font-family:var(--font-ui);font-size:14px;line-height:1.5;background:var(--bg);color:var(--ink);font-feature-settings:'ss01','cv11';scroll-padding-bottom:96px}header{position:sticky;top:0;z-index:2;background:var(--bg);border-bottom:1px solid var(--line)}.bar{max-width:1180px;margin:0 auto;padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px}.brand{display:flex;align-items:baseline;gap:10px;flex-shrink:0}h1{margin:0;font-family:var(--font-display);font-weight:600;font-size:22px;letter-spacing:-.01em;line-height:1}.brand-mark{color:var(--accent)}.brand-tag{font-family:var(--font-mono);font-size:11px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}.source-tabs{display:flex;gap:2px;overflow-x:auto;scroll-snap-type:x mandatory;flex:1;min-width:0;align-items:center;scrollbar-width:none;-ms-overflow-style:none}.source-tabs::-webkit-scrollbar{display:none}.tab-pill{appearance:none;background:transparent;border:none;color:var(--muted);font-family:var(--font-ui);font-weight:500;font-size:13px;padding:8px 12px;cursor:pointer;position:relative;display:inline-flex;align-items:center;gap:6px;white-space:nowrap;scroll-snap-align:start;border-radius:0}.tab-pill:hover{color:var(--ink)}.tab-pill.active{color:var(--ink)}.tab-pill.active::after{content:'';position:absolute;left:8px;right:8px;bottom:-8px;height:2px;background:var(--accent)}.tab-pill .kind-pill{font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:.06em;border:1px solid var(--line);border-radius:9999px;padding:1px 6px;color:var(--muted);background:var(--panel)}.tab-new{appearance:none;background:transparent;border:1px dashed var(--line);color:var(--muted);font-family:var(--font-ui);font-weight:500;font-size:12px;padding:6px 10px;cursor:pointer;border-radius:var(--r-sm);white-space:nowrap;flex-shrink:0}.tab-new:hover{color:var(--ink);border-color:var(--ink);border-style:solid}.tools{display:flex;gap:4px;align-items:center;flex-shrink:0}.tools .nav-link{appearance:none;background:transparent;border:none;color:var(--muted);font-size:12px;padding:6px 8px;cursor:pointer;font-family:var(--font-ui);font-weight:500;border-radius:var(--r-sm)}.tools .nav-link:hover{color:var(--ink)}.tools .nav-link.active{color:var(--ink)}main{max-width:1180px;margin:0 auto;padding:24px;display:block;overflow-x:clip}button,input,textarea,select{font:inherit}button{font-family:var(--font-ui);border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:var(--r-sm);padding:8px 12px;cursor:pointer;font-weight:500;transition:background 150ms ease-out,border-color 150ms ease-out,color 150ms ease-out,transform 80ms ease-out;display:inline-flex;align-items:center;justify-content:center;gap:6px}button:hover{border-color:var(--ink)}button:active{transform:translateY(1px)}button.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}button.primary:hover{background:#000;border-color:#000}button.accent{background:var(--accent);color:#fff;border-color:var(--accent)}button.accent:hover{background:#9F4823;border-color:#9F4823}button.danger-confirm{background:var(--accent);color:#fff;border-color:var(--accent)}button.ghost{background:transparent;border-color:transparent;color:var(--muted)}button.ghost:hover{color:var(--ink);background:var(--accent-soft);border-color:transparent}button:disabled{cursor:not-allowed;transform:none;background:var(--bg);color:var(--muted);border-color:var(--line)}button.accent:disabled,button.primary:disabled{background:var(--bg);color:var(--muted);border-color:var(--line);box-shadow:none}button.secondary{background:transparent;color:var(--ink);border-color:var(--line)}button.secondary:hover{border-color:var(--ink)}button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,.tab-pill:focus-visible{outline:2px solid var(--accent);outline-offset:2px}input,textarea,select{width:100%;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:var(--r-sm);padding:10px 12px;font-family:var(--font-ui);transition:border-color 150ms ease-out}input:hover,textarea:hover,select:hover{border-color:#B5B5AE}input::placeholder,textarea::placeholder{color:var(--muted);opacity:.7}textarea{min-height:96px;resize:vertical;line-height:1.45}.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:20px;margin-bottom:16px;box-shadow:var(--shadow-1)}.panel-head{font-family:var(--font-display);font-weight:500;font-size:13px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);margin:0 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}.field{display:grid;gap:6px;margin-bottom:12px}.field:last-child{margin-bottom:0}label{color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.01em}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.posts{display:grid;gap:14px}.post,.profile-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:20px;display:grid;gap:12px;box-shadow:var(--shadow-1)}.post textarea{min-height:96px}.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}.metric{border:1px solid var(--line);border-radius:var(--r-sm);padding:12px;background:var(--bg);font-variant-numeric:tabular-nums}.metric b{display:block;font-family:var(--font-display);font-weight:500;font-size:24px;line-height:1.1;letter-spacing:-.01em}.metric span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}.meta{color:var(--muted);font-size:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}.meta time,.meta .ts{font-family:var(--font-mono);font-size:11px}.pill{border:1px solid var(--line);border-radius:9999px;padding:2px 8px;background:var(--panel);font-size:11px;color:var(--muted);font-weight:500}.pill-source{border-color:var(--accent);color:var(--accent)}.pill-status{border-color:var(--ink);color:var(--ink);background:var(--bg);text-transform:lowercase;font-family:var(--font-mono);font-size:10px;letter-spacing:.04em;padding:2px 7px}.pill-status[data-status='posted']{border-color:var(--success);color:var(--success);background:transparent}.pill-status[data-status='failed']{border-color:var(--error);color:var(--error);background:transparent}.pill-status[data-status='rewrite_requested']{border-color:var(--info);color:var(--info);background:transparent}.score{color:var(--accent);font-variant-numeric:tabular-nums;font-weight:500}.posted{color:var(--success);font-size:12px}.failed{color:var(--error);white-space:pre-wrap;font-size:12px;padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--error)}.trend-list{display:grid;gap:0;font-size:13px;color:var(--ink)}.trend-list span{display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line);padding:6px 0;font-variant-numeric:tabular-nums}.trend-list span:last-child{border-bottom:none}.trend-list b{font-weight:500}.trend-list em{font-style:normal;color:var(--muted);font-family:var(--font-mono);font-size:11px}.sample{white-space:pre-wrap;border-top:1px solid var(--line);padding-top:12px;margin-top:4px;color:var(--ink);line-height:1.55}.empty{color:var(--muted);padding:32px 24px;border:1px solid var(--line);border-radius:var(--r-md);background:var(--panel);display:grid;gap:8px}.empty-title{font-family:var(--font-display);font-weight:500;font-size:18px;color:var(--ink);letter-spacing:-.01em}.empty-body{font-size:13px;line-height:1.5}.empty-hero{padding:48px 32px;text-align:left;display:grid;gap:14px;max-width:560px;margin:24px auto}.empty-hero h2{font-family:var(--font-display);font-weight:600;font-size:32px;letter-spacing:-.02em;margin:0;color:var(--ink)}.empty-hero p{margin:0;color:var(--muted);line-height:1.55}.empty-hero .row{margin-top:8px;gap:10px}.status-bar{font-family:var(--font-mono);font-size:11px;color:var(--muted);padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--line);min-height:32px;display:none;align-items:center;gap:8px}.status-bar.success{display:flex;color:var(--success);border-color:var(--success)}.status-bar.failed{display:flex;color:var(--error);border-color:var(--error);white-space:pre-wrap;align-items:flex-start;line-height:1.4}.status-bar.show{display:flex}.status-bar::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}.src-view{display:grid;grid-template-columns:320px 1fr;gap:24px;align-items:start}.src-side{position:sticky;top:80px;display:grid;gap:12px;align-self:start}.src-main{min-width:0;display:grid;gap:16px}.config-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);box-shadow:var(--shadow-1)}.config-card>summary{list-style:none;padding:14px 18px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-family:var(--font-display);font-weight:500;font-size:13px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}.config-card>summary::-webkit-details-marker{display:none}.config-card>summary::after{content:'';width:8px;height:8px;border-right:1.5px solid var(--muted);border-bottom:1.5px solid var(--muted);transform:rotate(-45deg);margin-right:4px;transition:transform 150ms ease-out}.config-card[open]>summary::after{transform:rotate(45deg);margin-top:-4px}.config-body{padding:0 18px 18px}.cta-stack{display:grid;gap:10px}.cta-sub{font-family:var(--font-mono);font-size:10px;color:var(--muted);text-align:center;margin-top:-2px}.cta-hint{font-size:12px;color:var(--muted);line-height:1.45;padding:0 2px}.cta-hint b{color:var(--ink);font-weight:500}.spinner{width:12px;height:12px;border-radius:50%;border:1.5px solid currentColor;border-right-color:transparent;animation:spin .6s linear infinite;display:inline-block}@keyframes spin{to{transform:rotate(360deg)}}.research-meta{font-family:var(--font-mono);font-size:11px;color:var(--muted);display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}.research-section{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}.research-section:first-of-type{border-top:0;padding-top:0;margin-top:0}.research-section>summary{cursor:pointer;font-weight:500;font-size:13px;color:var(--ink);padding:6px 0;list-style:none;display:flex;justify-content:space-between;align-items:center}.research-section>summary::-webkit-details-marker{display:none}.research-section>summary::after{content:'+';font-family:var(--font-mono);color:var(--muted);font-size:12px}.research-section[open]>summary::after{content:'\\2013'}.fact-list{margin:8px 0 0;padding-left:20px;display:grid;gap:6px;font-size:13px;line-height:1.5}.fact-cite{font-family:var(--font-mono);font-size:10px;color:var(--accent);vertical-align:super;margin-left:2px}.link-list{display:grid;gap:10px;margin-top:8px}.link-item{display:grid;gap:2px;padding:8px 10px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--bg)}.link-item a{color:var(--ink);text-decoration:none;font-weight:500;font-size:13px;line-height:1.35}.link-item a:hover{color:var(--accent)}.link-item .snippet{font-size:12px;color:var(--muted);line-height:1.4}.link-item .host{font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:lowercase;letter-spacing:.04em}.summary-list{margin:8px 0 0;padding-left:20px;display:grid;gap:6px;font-size:13px;line-height:1.5}.divider{border:0;border-top:1px solid var(--line);margin:8px 0 0}.main-tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:16px;position:sticky;top:65px;background:var(--bg);z-index:1;padding-top:2px;transition:box-shadow 150ms ease-out}.main-tabs[data-stuck=\"true\"]{box-shadow:0 6px 12px -6px rgba(10,10,10,.12)}.main-tab{appearance:none;background:transparent;border:none;border-radius:0;color:var(--muted);font-family:var(--font-ui);font-weight:500;font-size:14px;padding:10px 14px;cursor:pointer;position:relative;display:inline-flex;align-items:center;gap:8px;white-space:nowrap}.main-tab:hover{color:var(--ink);border:none}.main-tab.active{color:var(--ink)}.main-tab.active::after{content:'';position:absolute;left:14px;right:14px;bottom:-1px;height:2px;background:var(--accent)}.main-tab .tab-count{font-family:var(--font-mono);font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:9999px;padding:1px 7px;min-width:18px;text-align:center}.main-tab.active .tab-count{color:var(--ink);border-color:var(--ink)}.main-tab .tab-badge{font-family:var(--font-mono);font-size:10px;background:var(--accent);color:#fff;border-radius:9999px;padding:1px 7px;min-width:16px;text-align:center}.sel-summary{font-size:12px;color:var(--muted);padding:0 2px;display:flex;align-items:baseline;gap:6px}.sel-summary-count{font-family:var(--font-display);font-weight:600;font-size:22px;color:var(--accent);line-height:1;letter-spacing:-.01em}.viral-tile-engagement{display:flex;gap:12px;font-family:var(--font-mono);font-size:11px;color:var(--muted);border-top:1px solid var(--line);padding-top:6px;margin-top:2px}.viral-tile-engagement span{display:inline-flex;align-items:center;gap:3px}.viral-tile{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:12px 14px;cursor:pointer;display:grid;gap:8px;transition:border-color 150ms ease-out}.viral-tile:hover{border-color:var(--muted)}.viral-tile.selected{border-color:var(--accent);border-width:2px;padding:11px 13px;background:var(--accent-soft)}.viral-tile-body{font-size:13px;line-height:1.5;white-space:pre-wrap}.viral-tile-meta{display:flex;gap:8px;align-items:center;font-size:11px;color:var(--muted)}.viral-tile-meta a:hover{color:var(--accent)}.viral-tile-media{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:4px;border-radius:var(--r-sm);overflow:hidden}.viral-tile-media img{display:block;width:100%;height:100%;max-height:160px;object-fit:cover;border-radius:var(--r-sm);border:1px solid var(--line);background:var(--bg)}.viral-tile-cards{display:grid;gap:6px}.viral-card{display:grid;gap:2px;padding:8px 10px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--bg);text-decoration:none;color:var(--ink);transition:border-color 150ms ease-out}.viral-card:hover{border-color:var(--ink)}.viral-card-title{font-size:12px;font-weight:500;line-height:1.35;color:var(--ink)}.viral-card-host{font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:lowercase;letter-spacing:.04em}.viral-grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}.inspired-by{font-size:11px;color:var(--muted);font-family:var(--font-mono);margin-bottom:-4px}.note-block{font-size:12px;color:var(--muted);padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--line)}.section-head{font-family:var(--font-display);font-size:18px;font-weight:500;letter-spacing:-.01em;margin:0;color:var(--ink)}.section-row{display:flex;justify-content:space-between;align-items:baseline;gap:12px}.modal-overlay{position:fixed;inset:0;background:rgba(10,10,10,.42);display:none;align-items:center;justify-content:center;z-index:10;padding:16px}.modal-overlay.show{display:flex}.modal{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);box-shadow:var(--shadow-2);padding:24px;width:100%;max-width:420px;display:grid;gap:14px}.modal h3{margin:0;font-family:var(--font-display);font-size:20px;font-weight:600;letter-spacing:-.01em}.cost-bar{font-family:var(--font-mono);font-size:11px;color:var(--muted);padding:4px 10px;border-radius:var(--r-sm);display:none;align-items:center;gap:6px}.cost-bar.show{display:inline-flex}.chat-dock{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:5;width:min(760px,calc(100vw - 32px));background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);box-shadow:var(--shadow-2);padding:10px;display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center}.chat-dock-head{font-family:var(--font-display);font-weight:500;font-size:13px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:8px;white-space:nowrap}.chat-dock textarea{min-height:42px;height:42px;resize:none}.chat-dock .status-bar{grid-column:1/-1}.chat-log{display:none}@media(max-width:820px){body{padding-bottom:200px;scroll-padding-bottom:200px}main{padding:16px}.bar{padding:12px 16px;gap:10px;flex-wrap:wrap}.brand h1{font-size:18px}.src-view{grid-template-columns:1fr}.src-side{position:static}.viral-grid{grid-template-columns:1fr}.chat-dock{grid-template-columns:1fr}.chat-dock-head{justify-content:space-between}.chat-dock textarea{height:72px}.empty-hero{padding:24px 8px}.empty-hero h2{font-size:26px}}@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}";
 
   const HEADER = "<header><div class=\"bar\"><div class=\"brand\"><h1><span class=\"brand-mark\">x</span>squared</h1><span class=\"brand-tag\">drafts</span></div><div id=\"sourceTabs\" class=\"source-tabs\" role=\"tablist\" aria-label=\"Sources\"></div><div class=\"tools\"><span id=\"costBar\" class=\"cost-bar\" title=\"Latest LLM cost\"></span><button class=\"nav-link\" data-nav=\"profile\" data-route=\"/profile\">Profile</button><button id=\"doctor\" class=\"nav-link\">Doctor</button></div></div></header>";
+  const CSS_EXTRA = ".tab-shell{display:inline-flex;align-items:center;gap:0;scroll-snap-align:start}.tab-shell .tab-pill{scroll-snap-align:none;padding-right:8px}.tab-shell .tab-pill.active::after{right:-18px}.tab-remove{appearance:none;background:transparent;border:none;color:var(--muted);font-size:14px;line-height:1;width:22px;height:28px;padding:0;margin-left:-2px;border-radius:var(--r-sm);opacity:.55}.tab-shell:hover .tab-remove,.tab-remove:focus-visible{opacity:1}.tab-remove:hover{color:var(--error);background:var(--accent-soft);border-color:transparent}";
 
   const MODAL_HTML = "<div id=\"newSourceModal\" class=\"modal-overlay\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"newSourceTitle\"><div class=\"modal\"><h3 id=\"newSourceTitle\">New source</h3><p style=\"margin:0;color:var(--muted);font-size:13px;line-height:1.5\">A source is a researched topic you want to post about. We'll pull links and facts on demand, then generate drafts in your voice.</p><div class=\"field\"><label for=\"newSourceName\">Name</label><input id=\"newSourceName\" placeholder=\"e.g. AI agents, Google Ads for SMBs\"></div><div class=\"row\" style=\"justify-content:flex-end\"><button id=\"cancelNewSource\" class=\"ghost\">Cancel</button><button id=\"confirmNewSource\" class=\"primary\">Create</button></div></div></div>";
 
@@ -1319,11 +1879,20 @@ function esc(v){return String(v||'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&
 function fmtDate(d){if(!d)return '';const x=new Date(d);const diff=(Date.now()-x.getTime())/1000;if(diff<60)return 'just now';if(diff<3600)return Math.floor(diff/60)+'m ago';if(diff<86400)return Math.floor(diff/3600)+'h ago';if(diff<604800)return Math.floor(diff/86400)+'d ago';return x.toLocaleDateString(undefined,{month:'short',day:'numeric'})}
 function host(u){try{return new URL(u).host.replace(/^www\\./,'')}catch(e){return ''}}
 function spin(label){return '<span class="spinner"></span><span>'+esc(label)+'</span>'}
+function renderMediaPlan(media){
+  if(!media||!media.required)return '';
+  const imgs=Array.isArray(media.sourceImages)?media.sourceImages.filter(im=>im&&(im.thumbnailUrl||im.url)).slice(0,4):[];
+  const thumbs=imgs.length?'<div class="viral-tile-media">'+imgs.map(im=>'<a href="'+esc(im.url||im.thumbnailUrl)+'" target="_blank" rel="noopener"><img src="'+esc(im.thumbnailUrl||im.url)+'" alt="'+esc(im.altText||'source image')+'" loading="lazy"></a>').join('')+'</div>':'';
+  return '<div class="note-block"><b>Image required:</b> '+esc(media.brief||'Create an original image for this post.')+thumbs+'</div>';
+}
 function renderPostCard(p){
   const st=p.status||'draft';
   const inspired=(p.inspirationPosts&&p.inspirationPosts[0])?p.inspirationPosts[0]:null;
   const inspLine=inspired?'<div class="inspired-by">inspired by @'+esc(String(inspired.author||'').replace(/^@/,''))+'</div>':'';
-  return '<article class="post" data-id="'+esc(p.id)+'">'+inspLine+'<div class="meta"><span class="pill pill-status" data-status="'+esc(st)+'">'+esc(st)+'</span>'+(p.angle?'<span class="pill">'+esc(p.angle)+'</span>':'')+(p.score!=null?'<span class="score">'+esc(p.score)+'</span>':'')+'<span class="ts">'+fmtDate(p.updatedAt||p.createdAt)+'</span></div><textarea data-field="text">'+esc(p.text)+'</textarea>'+(p.notes?'<div class="note-block">'+esc(p.notes)+'</div>':'')+'<div class="field"><label>Instructions</label><input data-field="rewrite" placeholder="Optional: sharper, more specific, less hype..."></div><div class="row"><button data-action="save">Save</button><button data-action="rewrite">Request rewrite</button><button data-action="delete" class="ghost">Delete</button><button data-action="post" class="primary">Post to X</button></div>'+(p.postResult&&!p.postResult.ok?'<div class="failed">'+esc(p.postResult.stderr||p.postResult.error||'Post failed')+'</div>':'')+(p.postedAt?'<div class="posted">\\u2713 Posted '+fmtDate(p.postedAt)+'</div>':'')+'</article>';
+  const a=p.inspirationAnalysis||null;
+  const strategyLine=a?'<div class="note-block"><b>Why this source worked:</b> '+esc([a.hookType,a.structure,a.audiencePain].filter(Boolean).join(' / '))+'</div>':'';
+  const mediaLine=renderMediaPlan(p.media);
+  return '<article class="post" data-id="'+esc(p.id)+'">'+inspLine+'<div class="meta"><span class="pill pill-status" data-status="'+esc(st)+'">'+esc(st)+'</span>'+(p.angle?'<span class="pill">'+esc(p.angle)+'</span>':'')+(p.score!=null?'<span class="score">'+esc(p.score)+'</span>':'')+(p.media&&p.media.required?'<span class="pill">image needed</span>':'')+'<span class="ts">'+fmtDate(p.updatedAt||p.createdAt)+'</span></div><textarea data-field="text">'+esc(p.text)+'</textarea>'+mediaLine+strategyLine+(p.notes?'<div class="note-block">'+esc(p.notes)+'</div>':'')+'<div class="field"><label>Instructions</label><input data-field="rewrite" placeholder="Optional: sharper, more specific, less hype..."></div><div class="row"><button data-action="save">Save</button><button data-action="rewrite">Improve</button><button data-action="delete" class="ghost">Delete</button><button data-action="post" class="primary">Open in X</button></div>'+(p.postResult&&!p.postResult.ok?'<div class="failed">'+esc(p.postResult.stderr||p.postResult.error||'Post failed')+'</div>':'')+(p.postResult&&p.postResult.mode==='x-intent'?'<div class="posted">Opened X composer '+fmtDate(p.postResult.at)+'</div>':'')+(p.postedAt?'<div class="posted">\\u2713 Posted '+fmtDate(p.postedAt)+'</div>':'')+'</article>';
 }
 function renderDraftsForSource(sourceId){
   const list=state.posts.filter(p=>p.sourceId===sourceId);
@@ -1343,11 +1912,26 @@ function renderTabs(){
   const root=$('sourceTabs');
   const parts=state.sources.map(s=>{
     const active=s.id===state.activeId&&state.view==='source';
-    return '<button class="tab-pill'+(active?' active':'')+'" data-src="'+esc(s.id)+'" role="tab"><span>'+esc(s.name)+'</span><span class="kind-pill">'+esc(s.kind)+'</span></button>';
+    const removeLabel=s.kind==='topic'?'Remove topic':'Remove source';
+    return '<span class="tab-shell"><button class="tab-pill'+(active?' active':'')+'" data-src="'+esc(s.id)+'" role="tab"><span>'+esc(s.name)+'</span><span class="kind-pill">'+esc(s.kind)+'</span></button><button class="tab-remove" data-delete-src="'+esc(s.id)+'" title="'+esc(removeLabel)+': '+esc(s.name)+'" aria-label="'+esc(removeLabel)+': '+esc(s.name)+'">×</button></span>';
   });
   parts.push('<button id="newSourceBtn" class="tab-new" type="button">+ New source</button>');
   root.innerHTML=parts.join('');
   document.querySelectorAll('.nav-link[data-nav]').forEach(b=>b.classList.toggle('active',state.view===b.dataset.nav));
+}
+async function deleteSourceFromTabs(id){
+  const src=state.sources.find(s=>s.id===id);
+  if(!src)return;
+  const noun=src.kind==='topic'?'topic':'source';
+  if(!confirm('Remove '+noun+' "'+src.name+'"? Existing drafts will be kept.'))return;
+  try{
+    setStatus('Removing source...');
+    const r=await api('/api/sources/'+id,{method:'DELETE'});
+    setStatus((src.kind==='topic'?'Topic':'Source')+' removed'+(r.orphanedPostCount?' · '+r.orphanedPostCount+' drafts kept':''),'success');
+    await reloadSources();
+    const next=state.sources.find(s=>s.id!==id)||state.sources[0];
+    if(next)navigate('/sources/'+next.id);else navigate('/sources');
+  }catch(e){setStatus(e.message,'failed')}
 }
 function renderTopicView(src){
   const c=src.config||{};
@@ -1420,14 +2004,19 @@ function renderViralView(src){
       const cardHtml=cards.length?'<div class="viral-tile-cards">'+cards.slice(0,2).map(c=>{const host=(()=>{try{return new URL(c.url).hostname.replace(/^www\\./,'')}catch{return ''}})();return '<a href="'+esc(c.url)+'" target="_blank" rel="noopener" data-no-toggle class="viral-card">'+(c.title?'<span class="viral-card-title">'+esc(c.title)+'</span>':'')+'<span class="viral-card-host">'+esc(host||c.displayUrl||c.url)+'</span></a>'}).join('')+'</div>':'';
       const openHtml=tweetHref?'<a href="'+esc(tweetHref)+'" target="_blank" rel="noopener" data-no-toggle style="margin-left:auto;font-size:11px;color:var(--muted);text-decoration:none">open tweet \\u2197</a>':'';
       const engagement=(p.likeCount||p.retweetCount||p.replyCount)?'<div class="viral-tile-engagement"><span>\\u2764 '+(p.likeCount||0)+'</span><span>\\u21bb '+(p.retweetCount||0)+'</span><span>\\u{1F4AC} '+(p.replyCount||0)+'</span></div>':'';
-      return '<div class="viral-tile'+(sel?' selected':'')+'" data-fid="'+esc(p.id)+'"><div class="viral-tile-meta">'+handleHtml+dateHtml+openHtml+'</div><div class="viral-tile-body">'+esc(p.text)+'</div>'+imgHtml+cardHtml+engagement+'</div>';
+      const rel=p.relevance||null;
+      const relHtml=rel?'<div class="note-block"><b>'+esc(rel.score||0)+'/100 '+esc(rel.category||'relevance')+'</b>'+(rel.reason?' · '+esc(rel.reason):'')+(rel.useAs?'<br><span>'+esc(rel.useAs)+'</span>':'')+'</div>':'';
+      return '<div class="viral-tile'+(sel?' selected':'')+'" data-fid="'+esc(p.id)+'"><div class="viral-tile-meta">'+handleHtml+dateHtml+openHtml+'</div><div class="viral-tile-body">'+esc(p.text)+'</div>'+imgHtml+cardHtml+relHtml+engagement+'</div>';
     }).join('');
-    feedInner='<div class="research-meta"><span>'+selN+' of '+totalN+' selected</span><span>\\u00b7</span><span>click to toggle</span><span>\\u00b7</span><span>fetched '+fmtDate(snap.createdAt)+'</span></div><div class="viral-grid">'+tiles+'</div>';
+    const ranker=snap.ranker||null;
+    const rankHtml=ranker?'<span>DeepSeek ranked '+esc(ranker.outputCount||totalN)+'/'+esc(ranker.inputCount||totalN)+'</span><span>\\u00b7</span><span>'+esc(snap.relevanceFocus||ranker.focus||'relevance')+'</span><span>\\u00b7</span>':'';
+    feedInner='<div class="research-meta"><span>'+selN+' of '+totalN+' selected</span><span>\\u00b7</span><span>click to toggle</span><span>\\u00b7</span>'+rankHtml+'<span>fetched '+fmtDate(snap.createdAt)+'</span></div><div class="viral-grid">'+tiles+'</div>';
   }
   return '<div class="src-view"><aside class="src-side">'+
     '<details class="config-card" id="configCard" '+(collapsed?'':'open')+'><summary>Config</summary><div class="config-body">'+
     '<div class="field"><label for="cfgName">Name</label><input id="cfgName" value="'+esc(src.name)+'"></div>'+
     '<div class="field"><label for="cfgFilter">Filter</label><input id="cfgFilter" value="'+esc(c.filter||'')+'" placeholder="e.g. AI agents"></div>'+
+    '<div class="field"><label for="cfgRelevance">Relevance focus</label><input id="cfgRelevance" value="'+esc(c.relevanceFocus||'')+'" placeholder="AI, technology, Google Ads, automation"></div>'+
     '<div class="field"><label for="cfgResource">Resource</label><select id="cfgResource"><option value="home"'+(c.resource==='home'?' selected':'')+'>home</option><option value="following"'+(c.resource==='following'?' selected':'')+'>following</option><option value="for-you"'+(c.resource==='for-you'?' selected':'')+'>for-you</option></select></div>'+
     '<div class="field"><label for="cfgLimit">Limit</label><input id="cfgLimit" type="number" value="'+esc(c.limit||40)+'" min="1" max="200"></div>'+
     '<div class="row" style="margin-top:8px"><button id="saveCfgBtn" class="primary">Save</button><button id="deleteSrcBtn" class="ghost">Delete</button></div>'+
@@ -1486,7 +2075,7 @@ function bindSourceView(src){
       if(src.kind==='topic'){
         config={angle:$('cfgAngle').value,seedNotes:$('cfgNotes').value,useTweetVoice:$('cfgVoice').checked};
       }else{
-        config={filter:$('cfgFilter').value,resource:$('cfgResource').value,limit:Number($('cfgLimit').value)||40};
+        config={filter:$('cfgFilter').value,relevanceFocus:$('cfgRelevance').value,resource:$('cfgResource').value,limit:Number($('cfgLimit').value)||40};
       }
       const updated=await api('/api/sources/'+src.id,{method:'PATCH',body:JSON.stringify({name,config})});
       const idx=state.sources.findIndex(s=>s.id===src.id);
@@ -1591,20 +2180,20 @@ async function handlePostClick(ev){
   const id=c.dataset.id;const action=b.dataset.action;
   try{
     if(action==='save'){await api('/api/posts/'+id,{method:'PATCH',body:JSON.stringify({text:c.querySelector('[data-field="text"]').value})});setStatus('Saved.','success')}
-    if(action==='rewrite'){await api('/api/posts/'+id+'/rewrite-request',{method:'POST',body:JSON.stringify({instruction:c.querySelector('[data-field="rewrite"]').value})});setStatus('Rewrite request saved.','success')}
+    if(action==='rewrite'){b.innerHTML=spin('Improving');b.disabled=true;await api('/api/posts/'+id+'/rewrite',{method:'POST',body:JSON.stringify({instruction:c.querySelector('[data-field="rewrite"]').value})});setStatus('Improved and saved.','success')}
     if(action==='delete'){
       if(!pendingDelete.has(id)){const orig=b.textContent;b.classList.add('danger-confirm');b.textContent='Click again to delete';const t=setTimeout(()=>{if(pendingDelete.get(id)===t){pendingDelete.delete(id);b.classList.remove('danger-confirm');b.textContent=orig}},6000);pendingDelete.set(id,t);setStatus('Confirm: click again within 6s to delete.');return}
       clearTimeout(pendingDelete.get(id));pendingDelete.delete(id);b.classList.remove('danger-confirm');b.innerHTML=spin('Deleting');b.disabled=true;
       await api('/api/posts/'+id,{method:'DELETE'});setStatus('Draft deleted.','success');
     }
     if(action==='post'){
-      if(!pendingPost.has(id)){const orig=b.textContent;b.classList.add('danger-confirm');b.textContent='Click again to post';const t=setTimeout(()=>{if(pendingPost.get(id)===t){pendingPost.delete(id);b.classList.remove('danger-confirm');b.textContent=orig}},6000);pendingPost.set(id,t);setStatus('Confirm: click again within 6s to post.');return}
-      clearTimeout(pendingPost.get(id));pendingPost.delete(id);b.classList.remove('danger-confirm');b.innerHTML=spin('Posting');b.disabled=true;
+      b.innerHTML=spin('Opening');b.disabled=true;
       const posted=await api('/api/posts/'+id+'/post',{method:'POST'});
-      if(posted.status==='posted')setStatus('Posted.','success');else setStatus('Post failed. Check card for result.','failed');
+      if(posted.intentUrl)window.open(posted.intentUrl,'_blank','noopener');
+      setStatus(posted.mediaRequired?'Opened X composer. Attach the image before posting.':'Opened X composer.','success');
     }
     await reloadAll();
-  }catch(e){setStatus(e.message,'failed');b.disabled=false;if(action==='post')b.textContent='Post to X';if(action==='delete')b.textContent='Delete';b.classList.remove('danger-confirm')}
+  }catch(e){setStatus(e.message,'failed');b.disabled=false;if(action==='post')b.textContent='Open in X';if(action==='rewrite')b.textContent='Improve';if(action==='delete')b.textContent='Delete';b.classList.remove('danger-confirm')}
 }
 function handlePostInput(ev){
   const t=ev.target;if(!t.matches||!t.matches('textarea[data-field="text"]'))return;
@@ -1673,7 +2262,7 @@ async function init(){
     bindModal();
     document.body.addEventListener('click',ev=>{const b=ev.target.closest('#newSourceBtn');if(b){openModal()}});
     document.querySelectorAll('[data-nav]').forEach(b=>b.onclick=()=>navigate(b.dataset.route));
-    document.querySelectorAll('#sourceTabs').forEach(el=>el.addEventListener('click',ev=>{const t=ev.target.closest('.tab-pill');if(t)navigate('/sources/'+t.dataset.src)}));
+    document.querySelectorAll('#sourceTabs').forEach(el=>el.addEventListener('click',ev=>{const d=ev.target.closest('[data-delete-src]');if(d){deleteSourceFromTabs(d.dataset.deleteSrc);return}const t=ev.target.closest('.tab-pill');if(t)navigate('/sources/'+t.dataset.src)}));
     window.addEventListener('popstate',()=>applyRoute(window.location.pathname));
     applyRoute(window.location.pathname);
     setStatus('Ready.');
@@ -1690,7 +2279,7 @@ init();
     "<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>xsquared</title>",
     "<link rel=\"preconnect\" href=\"https://fonts.bunny.net\">",
     "<link href=\"https://fonts.bunny.net/css?family=geist:400,500,600|geist-mono:400,500|fraunces:500,600&display=swap\" rel=\"stylesheet\">",
-    "<style>" + CSS + "</style></head><body>",
+    "<style>" + CSS + CSS_EXTRA + "</style></head><body>",
     HEADER,
     "<main><div id=\"appRoot\"></div></main>" + MODAL_HTML + CHAT_DOCK,
     "<script>" + JS + "</script></body></html>"
@@ -1698,7 +2287,7 @@ init();
 }
 
 function sendJson(res, status, body) {
-  res.writeHead(status, { "content-type": "application/json" });
+  res.writeHead(status, { "content-type": "application/json", ...NO_CACHE_HEADERS });
   res.end(JSON.stringify(body, null, 2));
 }
 
@@ -1716,11 +2305,11 @@ function startDashboard(port, host) {
       const isSourceRoute = url.pathname === "/sources" || url.pathname.startsWith("/sources/");
       if (req.method === "GET" && (["/", "/posts", "/generate", "/profile"].includes(url.pathname) || isSourceRoute)) {
         if (url.pathname === "/") {
-          res.writeHead(302, { location: "/sources" });
+          res.writeHead(302, { location: "/sources", ...NO_CACHE_HEADERS });
           res.end();
           return;
         }
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", ...NO_CACHE_HEADERS });
         res.end(html());
         return;
       }
@@ -1770,11 +2359,11 @@ function startDashboard(port, host) {
         sendJson(res, 200, deletePost(postMatch[1]));
         return;
       }
-      const actionMatch = url.pathname.match(/^\/api\/posts\/([^/]+)\/(post|rewrite-request)$/);
+      const actionMatch = url.pathname.match(/^\/api\/posts\/([^/]+)\/(post|rewrite|rewrite-request)$/);
       if (req.method === "POST" && actionMatch) {
         const body = await readBody(req);
         if (actionMatch[2] === "post") sendJson(res, 200, postToX(actionMatch[1], body.account || DEFAULT_ACCOUNT));
-        else sendJson(res, 200, addRewriteRequest(actionMatch[1], body.instruction));
+        else sendJson(res, 200, rewritePostNow(actionMatch[1], body.instruction));
         return;
       }
       if (url.pathname === "/api/trends" || url.pathname === "/api/feed" || url.pathname === "/api/feed/latest" || url.pathname === "/api/directions" || url.pathname.match(/^\/api\/directions\//)) {
@@ -1847,7 +2436,7 @@ async function main() {
   const cmd = parts[0] || "help";
   const rest = parts.slice(1);
   if (cmd === "help" || cmd === "--help" || cmd === "-h") {
-    output("xsquared commands:\n  doctor [--json]\n  strategy [--json]\n  strategy-set --area <posting area> [--json]\n  trends [--topic <topic>] [--limit 40] [--resource home] [--json]\n  sources [--kind topic|viral] [--json]\n  source-new --kind <topic|viral> --name <name> [--angle <a>] [--notes <n>] [--filter <f>] [--resource home|following|for-you] [--limit 40] [--no-voice] [--json]\n  source-edit <source-id> [--name ...] [--angle ...] [--notes ...] [--filter ...] [--resource ...] [--limit N]\n  source-delete <source-id>\n  research <source-id> [--json]\n  viral-fetch <source-id> [--json]\n  generate <source-id> [--count 5] [--selected id,id,id] [--json]\n  profile-learn [--handle @you] [--limit 200] [--query <query>] [--json]\n  profile [--json]\n  save --text <text> [--topic <topic>] [--angle <angle>] [--score 80] [--notes <notes>]\n  import-json <file>\n  list [--source <source-id>] [--json]\n  update <post-id> [--text <text>] [--status <status>] [--notes <notes>] [--score <score>]\n  rewrite-request <post-id> [--instruction <text>]\n  rewrite-requests [--json]\n  post <post-id> [--account acct_primary]\n  dashboard [--port 3888] [--host 127.0.0.1]\n\nEnv:\n  XSQUARED_CLAUDE_MODEL (default: sonnet)\n  XSQUARED_RESEARCH_BUDGET_USD (default: 0.50)\n  XSQUARED_DISABLE_LLM=1 forces template fallback");
+    output("xsquared commands:\n  doctor [--json]\n  strategy [--json]\n  strategy-set --area <posting area> [--json]\n  trends [--topic <topic>] [--limit 40] [--resource home] [--json]\n  sources [--kind topic|viral] [--json]\n  source-new --kind <topic|viral> --name <name> [--angle <a>] [--notes <n>] [--filter <f>] [--resource home|following|for-you] [--limit 40] [--no-voice] [--json]\n  source-edit <source-id> [--name ...] [--angle ...] [--notes ...] [--filter ...] [--resource ...] [--limit N]\n  source-delete <source-id>\n  research <source-id> [--json]\n  viral-fetch <source-id> [--json]\n  generate <source-id> [--count 5] [--selected id,id,id] [--json]\n  auto-draft [source-id] [--max-drafts 3] [--min-score 75] [--json]\n  validate-draft <source-id> --text <draft> [--inspiration-id <feed-post-id>] [--json]\n  profile-learn [--handle @you] [--limit 200] [--query <query>] [--json]\n  profile [--json]\n  save --text <text> [--topic <topic>] [--angle <angle>] [--score 80] [--notes <notes>]\n  import-json <file>\n  list [--source <source-id>] [--json]\n  update <post-id> [--text <text>] [--status <status>] [--notes <notes>] [--score <score>]\n  rewrite-request <post-id> [--instruction <text>]\n  rewrite-requests [--json]\n  post <post-id> [--account acct_primary]\n  dashboard [--port 3888] [--host 127.0.0.1]\n\nEnv:\n  XSQUARED_CLAUDE_MODEL (default: sonnet)\n  XSQUARED_RESEARCH_BUDGET_USD (default: 0.50)\n  XSQUARED_DISABLE_LLM=1 forces template fallback");
     return;
   }
   if (cmd === "doctor") {
@@ -1879,23 +2468,24 @@ async function main() {
     return;
   }
   if (cmd === "source-new") {
-    const opts = parseArgs({ args: rest, options: { kind: { type: "string" }, name: { type: "string" }, angle: { type: "string" }, notes: { type: "string" }, filter: { type: "string" }, resource: { type: "string" }, limit: { type: "string" }, "no-voice": { type: "boolean" }, json: { type: "boolean" } } });
+    const opts = parseArgs({ args: rest, options: { kind: { type: "string" }, name: { type: "string" }, angle: { type: "string" }, notes: { type: "string" }, filter: { type: "string" }, relevance: { type: "string" }, resource: { type: "string" }, limit: { type: "string" }, "no-voice": { type: "boolean" }, json: { type: "boolean" } } });
     const kind = opts.values.kind === "viral" ? "viral" : "topic";
     const config = kind === "topic"
       ? { angle: opts.values.angle || "", seedNotes: opts.values.notes || "", useTweetVoice: !opts.values["no-voice"] }
-      : { filter: opts.values.filter || "", resource: opts.values.resource || "home", limit: Number(opts.values.limit || "40") };
+      : { filter: opts.values.filter || "", relevanceFocus: opts.values.relevance || "", resource: opts.values.resource || "home", limit: Number(opts.values.limit || "40") };
     output(createSource({ kind, name: opts.values.name || "", config }), Boolean(opts.values.json));
     return;
   }
   if (cmd === "source-edit") {
     const id = requireArg(rest[0], "source-id");
-    const opts = parseArgs({ args: rest.slice(1), options: { name: { type: "string" }, angle: { type: "string" }, notes: { type: "string" }, filter: { type: "string" }, resource: { type: "string" }, limit: { type: "string" }, "use-voice": { type: "boolean" }, "no-voice": { type: "boolean" }, archived: { type: "boolean" }, json: { type: "boolean" } } });
+    const opts = parseArgs({ args: rest.slice(1), options: { name: { type: "string" }, angle: { type: "string" }, notes: { type: "string" }, filter: { type: "string" }, relevance: { type: "string" }, resource: { type: "string" }, limit: { type: "string" }, "use-voice": { type: "boolean" }, "no-voice": { type: "boolean" }, archived: { type: "boolean" }, json: { type: "boolean" } } });
     const config: any = {};
     if (opts.values.angle !== undefined) config.angle = opts.values.angle;
     if (opts.values.notes !== undefined) config.seedNotes = opts.values.notes;
     if (opts.values["use-voice"]) config.useTweetVoice = true;
     if (opts.values["no-voice"]) config.useTweetVoice = false;
     if (opts.values.filter !== undefined) config.filter = opts.values.filter;
+    if (opts.values.relevance !== undefined) config.relevanceFocus = opts.values.relevance;
     if (opts.values.resource !== undefined) config.resource = opts.values.resource;
     if (opts.values.limit !== undefined) config.limit = Number(opts.values.limit);
     const updates: any = { config };
@@ -1939,6 +2529,26 @@ async function main() {
     output(generateForSource(sourceId, { count: opts.values.count ? Number(opts.values.count) : 5, selectedPostIds: selected }), Boolean(opts.values.json));
     return;
   }
+  if (cmd === "auto-draft") {
+    const sourceId = rest[0] && !rest[0].startsWith("-") ? rest[0] : "";
+    const argTail = sourceId ? rest.slice(1) : rest;
+    const opts = parseArgs({ args: argTail, options: { "max-drafts": { type: "string" }, "min-score": { type: "string" }, json: { type: "boolean" } } });
+    const result = autoDraftViral({
+      sourceId,
+      maxDrafts: opts.values["max-drafts"] ? Number(opts.values["max-drafts"]) : 3,
+      minScore: opts.values["min-score"] ? Number(opts.values["min-score"]) : 75
+    });
+    if (opts.values.json) output(result, true);
+    else output(result.totalDrafted ? "Created " + result.totalDrafted + " draft(s)." : "No new qualifying posts.");
+    return;
+  }
+  if (cmd === "validate-draft") {
+    const sourceId = requireArg(rest[0], "source-id");
+    const opts = parseArgs({ args: rest.slice(1), options: { text: { type: "string" }, "inspiration-id": { type: "string" }, json: { type: "boolean" } } });
+    const result = validateDraftCommand(sourceId, { text: opts.values.text || "", inspirationId: opts.values["inspiration-id"] || "" });
+    output(result, Boolean(opts.values.json));
+    return;
+  }
   if (cmd === "profile-learn") {
     const opts = parseArgs({ args: rest, options: { handle: { type: "string" }, limit: { type: "string" }, query: { type: "string" }, json: { type: "boolean" } } });
     output(learnProfile(opts), Boolean(opts.values.json));
@@ -1974,10 +2584,10 @@ async function main() {
     output(updatePost(postId, opts.values), Boolean(opts.values.json));
     return;
   }
-  if (cmd === "rewrite-request") {
+  if (cmd === "rewrite" || cmd === "rewrite-request") {
     const postId = requireArg(rest[0], "post-id");
     const opts = parseArgs({ args: rest.slice(1), options: { instruction: { type: "string" }, json: { type: "boolean" } } });
-    output(addRewriteRequest(postId, opts.values.instruction), Boolean(opts.values.json));
+    output(rewritePostNow(postId, opts.values.instruction), Boolean(opts.values.json));
     return;
   }
   if (cmd === "rewrite-requests") {

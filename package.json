@@ -10,6 +10,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dashboard": "npm run build --silent && node dist/xsquared.js dashboard",
+    "dashboard:dev": "node scripts/dashboard-dev.mjs",
+    "auto-draft": "npm run build --silent && node dist/xsquared.js auto-draft --json",
+    "hourly-drafts": "node scripts/hourly-auto-draft.mjs",
+    "validate:grounding": "npm run build --silent && node scripts/validate-grounding-regression.mjs",
     "trends": "npm run build --silent && node dist/xsquared.js trends",
     "generate": "npm run build --silent && node dist/xsquared.js generate",
     "strategy": "npm run build --silent && node dist/xsquared.js strategy",
