@@ -12,6 +12,10 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(SCRIPT_DIR, "..");
 const APP_DIR = process.env.XSQUARED_HOME || path.join(PLUGIN_ROOT, ".xsquared");
 const STORE_PATH = path.join(APP_DIR, "store.json");
+const STORE_BACKUP_PATH = path.join(APP_DIR, "store.backup.json");
+const CLAUDE_BIN = process.env.XSQUARED_CLAUDE_BIN || "claude";
+const CLAUDE_MODEL = process.env.XSQUARED_CLAUDE_MODEL || "sonnet";
+const RESEARCH_BUDGET_USD = process.env.XSQUARED_RESEARCH_BUDGET_USD || "0.50";
 const LOCAL_BIRDCLAW_BIN = path.join(PLUGIN_ROOT, "node_modules", ".bin", process.platform === "win32" ? "birdclaw.cmd" : "birdclaw");
 const LOCAL_BIRDCLAW_SCRIPT = path.join(PLUGIN_ROOT, "node_modules", "birdclaw", "bin", "birdclaw.mjs");
 const DEFAULT_PROFILE_HANDLE = process.env.XSQUARED_HANDLE || "@therealtongchen";
@@ -26,13 +30,14 @@ const BIRDCLAW_CANDIDATES = process.env.BIRDCLAW_BIN
 function ensureStore() {
   mkdirSync(APP_DIR, { recursive: true });
   if (!existsSync(STORE_PATH)) {
-    writeFileSync(STORE_PATH, JSON.stringify({ version: 1, strategy: { contentArea: "", updatedAt: null }, posts: [], trendSnapshots: [], profileSnapshots: [], generationSnapshots: [], rewriteRequests: [], feedSnapshots: [], directions: [], chatMessages: [], chatConfig: {} }, null, 2));
+    writeFileSync(STORE_PATH, JSON.stringify({ version: 2, strategy: { contentArea: "", updatedAt: null }, posts: [], trendSnapshots: [], profileSnapshots: [], generationSnapshots: [], rewriteRequests: [], feedSnapshots: [], directions: [], sources: [], chatMessages: [], chatConfig: {} }, null, 2));
   }
 }
 
 function readStore() {
   ensureStore();
   const store = JSON.parse(readFileSync(STORE_PATH, "utf8"));
+  store.version ||= 1;
   store.strategy ||= { contentArea: "", updatedAt: null };
   store.posts ||= [];
   store.trendSnapshots ||= [];
@@ -41,8 +46,62 @@ function readStore() {
   store.rewriteRequests ||= [];
   store.feedSnapshots ||= [];
   store.directions ||= [];
+  store.sources ||= [];
   store.chatMessages ||= [];
   store.chatConfig ||= {};
+  if (store.version < 2) {
+    // Back up before any mutation.
+    try { writeFileSync(STORE_BACKUP_PATH, JSON.stringify(store, null, 2)); } catch {}
+    // Migrate directions -> topic sources.
+    for (const d of store.directions || []) {
+      const newId = String(d.id || "").replace(/^dir_/, "src_topic_") || makeId("src_topic");
+      if (store.sources.find(function(s) { return s.id === newId; })) continue;
+      store.sources.push({
+        id: newId,
+        kind: "topic",
+        name: d.name || "Untitled topic",
+        createdAt: d.createdAt || nowIso(),
+        updatedAt: d.updatedAt || d.createdAt || nowIso(),
+        config: {
+          angle: String(d.description || ""),
+          seedNotes: Array.isArray(d.references) ? d.references.filter(Boolean).join("\n---\n") : "",
+          useTweetVoice: d.useTweetSamples !== false
+        },
+        research: null
+      });
+    }
+    // Backfill posts.sourceId from posts.directionId.
+    for (const p of store.posts || []) {
+      if (p.directionId && !p.sourceId) {
+        p.sourceId = String(p.directionId).replace(/^dir_/, "src_topic_");
+      }
+      if (p.sourceId === undefined) p.sourceId = null;
+    }
+    store.version = 2;
+    writeStore(store);
+  } else {
+    // Defensive: ensure every post has a sourceId key.
+    let mutated = false;
+    for (const p of store.posts || []) {
+      if (p.sourceId === undefined) { p.sourceId = p.directionId ? String(p.directionId).replace(/^dir_/, "src_topic_") : null; mutated = true; }
+    }
+    if (mutated) writeStore(store);
+  }
+  // Seed the default viral source if it doesn't exist. Users only ever create topic sources;
+  // the viral feed is a singleton that ships with the app.
+  if (!store.sources.some(function(s) { return s.kind === "viral"; })) {
+    store.sources.push({
+      id: "src_viral_default",
+      kind: "viral",
+      name: "Viral feed",
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      config: { filter: "", resource: "home", limit: 40 },
+      research: null,
+      lastFeedSnapshot: null
+    });
+    writeStore(store);
+  }
   return store;
 }
 
@@ -83,6 +142,19 @@ function birdclaw(args) {
 
 function openclaw(args, timeoutMs = 600000) {
   return run("openclaw", args, { timeout: timeoutMs });
+}
+
+const XURL_BIN = process.env.XURL_BIN || "xurl";
+function xurl(args, timeoutMs = 30000) {
+  return run(XURL_BIN, args, { timeout: timeoutMs });
+}
+function xurlAuthStatus() {
+  // `xurl auth status` returns "No apps registered..." on stdout when nothing's set up.
+  // When apps are registered it lists them and exits 0.
+  const r = xurl(["auth", "status"], 10000);
+  const out = (r.stdout + r.stderr).trim();
+  const hasApps = r.ok && !/no apps registered/i.test(out);
+  return { ok: hasApps, message: out };
 }
 
 function output(value, json = false) {
@@ -323,6 +395,504 @@ function analyzeWritingProfile(tweets, handle) {
   };
 }
 
+function callClaude(prompt, opts) {
+  opts = opts || {};
+  const args = [
+    "-p",
+    "--output-format", "json",
+    "--model", CLAUDE_MODEL,
+    "--permission-mode", "bypassPermissions",
+    "--max-budget-usd", String(opts.budgetUsd || "0.50"),
+    "--no-session-persistence",
+    "--input-format", "text"
+  ];
+  if (opts.allowTools && opts.allowTools.length) {
+    // Use comma-separated form so it consumes a single value.
+    args.push("--allowedTools", opts.allowTools.join(","));
+  } else {
+    args.push("--tools", "");
+  }
+  // Pass prompt via stdin to avoid variadic-arg parsing collisions.
+  return run(CLAUDE_BIN, args, { timeout: opts.timeoutMs || 180000, maxBuffer: 32 * 1024 * 1024, input: prompt });
+}
+
+function extractFencedJson(text) {
+  const raw = String(text || "");
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const body = fenced ? fenced[1] : raw;
+  try { return JSON.parse(body); } catch {}
+  // Fallback: scan for outermost { ... }.
+  const first = body.indexOf("{");
+  const last = body.lastIndexOf("}");
+  if (first >= 0 && last > first) {
+    try { return JSON.parse(body.slice(first, last + 1)); } catch {}
+  }
+  return {};
+}
+
+function summarizeProfileForPrompt(snapshot) {
+  const profile = (snapshot && snapshot.profile) || {};
+  const metrics = profile.metrics || {};
+  const terms = ((profile.terms && profile.terms.terms) || []).slice(0, 8).map(function(t) { return t.term; }).join(", ");
+  return [
+    "- median chars: " + (metrics.medianChars || "?") + ", median lines: " + (metrics.medianLines || "?"),
+    "- short posts (<=140 chars): " + (metrics.shortPostPct || 0) + "%; long posts (>240): " + (metrics.longPostPct || 0) + "%",
+    "- uses links: " + (metrics.linkPct || 0) + "%; hashtags: " + (metrics.hashtagPct || 0) + "%; questions: " + (metrics.questionPct || 0) + "%",
+    "- recurring terms: " + (terms || "(none)"),
+    "- guidance: " + ((profile.guidance || []).join(" | ") || "(none)")
+  ].join("\n");
+}
+
+function buildResearchPrompt(source) {
+  const c = source.config || {};
+  return [
+    "You are doing background research for an X (Twitter) post about a specific topic.",
+    "Use the WebSearch and WebFetch tools to find 6-10 high-signal recent sources.",
+    "",
+    "Topic: " + source.name,
+    "Angle / objective: " + (c.angle || "(none specified)"),
+    "User's seed notes (treat as constraints, not as conclusions):",
+    c.seedNotes ? c.seedNotes : "(none)",
+    "",
+    "Return a single JSON object inside a ```json fenced block, matching this shape exactly:",
+    "{",
+    "  \"query\": \"<the search query you used>\",",
+    "  \"links\": [{\"url\":\"...\",\"title\":\"...\",\"snippet\":\"<one-sentence summary>\"}],",
+    "  \"summaries\": [\"<2-5 short bullet-style takeaways from the research>\"],",
+    "  \"facts\": [\"<short concrete claim with [n] citation index referring to links[n-1]>\"]",
+    "}",
+    "",
+    "Rules:",
+    "- Prefer primary sources (docs, official posts, named researchers) over content farms.",
+    "- Each fact must end with a [n] index pointing to links[n-1].",
+    "- No hedging, no 'as an AI'. Output the JSON and nothing else."
+  ].join("\n");
+}
+
+function buildTopicGenPrompt(source, profile, count) {
+  const c = source.config || {};
+  const res = source.research;
+  const voice = profile ? summarizeProfileForPrompt(profile) : "(no learned voice - use a direct, builder-to-builder tone, ~140-200 chars per post)";
+  return [
+    "You are drafting " + count + " candidate X (Twitter) posts. Output JSON only.",
+    "",
+    "Topic: " + source.name,
+    "Angle: " + (c.angle || "(none)"),
+    "User seed notes: " + (c.seedNotes || "(none)"),
+    "",
+    res ? "Research findings (use these - do not invent stats):" : "No research yet - write from the angle + seed notes only.",
+    res ? "Summaries:\n- " + (res.summaries || []).join("\n- ") : "",
+    res ? "Facts:\n- " + (res.facts || []).join("\n- ") : "",
+    res && (res.links || []).length ? "Source URLs available if you cite, but you usually shouldn't link in a post." : "",
+    "",
+    "Voice profile:",
+    voice,
+    "",
+    "Return a single JSON object inside a ```json fence:",
+    "{ \"posts\": [ { \"text\": \"<the post>\", \"angle\": \"<3-5 word label>\", \"score\": <60-95>, \"notes\": \"<why this one might land>\" } ] }",
+    "",
+    "Rules:",
+    "- " + count + " posts. Each <= 280 chars.",
+    "- No hashtags unless the voice profile says they're used >15% of the time.",
+    "- No emojis unless the voice profile shows them.",
+    "- No 'thread' framing unless asked.",
+    "- Each post stands alone."
+  ].filter(Boolean).join("\n");
+}
+
+function buildViralGenPrompt(sourceName, inspiration, profile, count) {
+  const voice = profile ? summarizeProfileForPrompt(profile) : "(direct, no hype, ~140-200 chars)";
+  const lines = [
+    "Draft " + count + " original X posts inspired by these recently-viral posts.",
+    "Each draft should respond to ONE inspiration post with the user's own angle - NOT a quote-tweet reply, but a standalone post that takes a position.",
+    "",
+    "Topic context: " + sourceName,
+    "",
+    "Inspiration posts:"
+  ];
+  inspiration.forEach(function(p, i) {
+    const safe = String(p.text || "").replace(/\n+/g, " ").slice(0, 280);
+    lines.push("[" + (i + 1) + "] @" + (p.author || "?") + ": " + safe);
+  });
+  lines.push("");
+  lines.push("Voice profile:");
+  lines.push(voice);
+  lines.push("");
+  lines.push("Return JSON: { \"posts\": [ { \"text\": \"...\", \"angle\": \"...\", \"score\": 60-95, \"notes\": \"...\", \"inspirationIndex\": <1..N> } ] }");
+  lines.push("");
+  lines.push("Rules: same as before - <=280 chars, voice-matched, no hype.");
+  return lines.join("\n");
+}
+
+function callLlmForDrafts(prompt, count) {
+  if (process.env.XSQUARED_DISABLE_LLM === "1") return null;
+  const r = callClaude(prompt, { budgetUsd: process.env.XSQUARED_GENERATE_BUDGET_USD || "0.50", timeoutMs: 120000 });
+  if (!r.ok) return null;
+  const env = r.stdout.trim() ? safeJson(r.stdout.trim()) : null;
+  if (!env || typeof env !== "object" || env.is_error) return null;
+  const parsed = extractFencedJson(String(env.result || ""));
+  const posts = parsed && Array.isArray(parsed.posts) ? parsed.posts : [];
+  if (!posts.length) return null;
+  const drafts = posts.slice(0, count).map(function(p) {
+    return {
+      text: String((p && p.text) || "").trim(),
+      angle: String((p && p.angle) || ""),
+      score: Number(p && p.score) || 75,
+      notes: String((p && p.notes) || ""),
+      source: "xsquared-generator",
+      inspirationIndex: p && p.inspirationIndex
+    };
+  }).filter(function(p) { return p.text; });
+  // Attach cost/duration metadata.
+  drafts._meta = { costUsd: Number(env.total_cost_usd || 0), durationMs: Number(env.duration_ms || 0) };
+  return drafts;
+}
+
+function runResearch(sourceId) {
+  const store = readStore();
+  const source = store.sources.find(function(s) { return s.id === sourceId; });
+  if (!source) throw new Error("source not found: " + sourceId);
+  if (source.kind !== "topic") throw new Error("research only valid for topic sources");
+  const t0 = Date.now();
+  const r = callClaude(buildResearchPrompt(source), {
+    allowTools: ["WebSearch", "WebFetch"],
+    budgetUsd: RESEARCH_BUDGET_USD,
+    timeoutMs: 240000
+  });
+  if (!r.ok) throw new Error("claude failed: " + (r.stderr.trim() || r.error || "exit " + r.status));
+  const envelope = r.stdout.trim() ? safeJson(r.stdout.trim()) : null;
+  if (!envelope || typeof envelope !== "object") throw new Error("claude returned unparseable output");
+  if (envelope.is_error) throw new Error("claude error: " + (envelope.result || "unknown"));
+  const rawText = String(envelope.result || "");
+  const parsed = extractFencedJson(rawText) || {};
+  const links = Array.isArray(parsed.links) ? parsed.links.slice(0, 12).map(function(link) {
+    return {
+      url: String((link && link.url) || ""),
+      title: String((link && link.title) || ""),
+      snippet: String((link && link.snippet) || "")
+    };
+  }) : [];
+  // Cap raw at 20KB.
+  const rawCapped = rawText.length > 20000 ? rawText.slice(0, 20000) + "\n...(truncated)" : rawText;
+  const artifact = {
+    id: makeId("res"),
+    createdAt: nowIso(),
+    query: String((parsed && parsed.query) || source.name),
+    links,
+    summaries: Array.isArray(parsed.summaries) ? parsed.summaries.slice(0, 8).map(String) : [],
+    facts: Array.isArray(parsed.facts) ? parsed.facts.slice(0, 20).map(String) : [],
+    raw: rawCapped,
+    costUsd: Number(envelope.total_cost_usd || 0),
+    durationMs: Date.now() - t0
+  };
+  const s2 = readStore();
+  const src = s2.sources.find(function(s) { return s.id === sourceId; });
+  if (!src) throw new Error("source disappeared during research: " + sourceId);
+  src.research = artifact;
+  src.updatedAt = nowIso();
+  writeStore(s2);
+  return artifact;
+}
+
+// Adapter so the template fallback keeps working unchanged.
+function adaptTopicToDirection(source) {
+  const c = source.config || {};
+  return {
+    id: source.id,
+    name: source.name,
+    description: c.angle || "",
+    references: c.seedNotes ? String(c.seedNotes).split(/\n---\n/) : [],
+    useTweetSamples: c.useTweetVoice !== false
+  };
+}
+
+function mapBirdItems(items) {
+  // `bird home`/`bird search` returns an array of tweets with this shape:
+  //   { id, text, createdAt, author:{username,name}, authorId, media:[{type,url,previewUrl,width,height}], likeCount, retweetCount, replyCount, quotedTweet, ... }
+  // We do not get entity-level url cards from bird; t.co links inside `text` are the only signal.
+  return (Array.isArray(items) ? items : []).map(function(t) {
+    const handle = (t.author && t.author.username) ? String(t.author.username).replace(/^@/, "") : null;
+    const tweetUrl = handle && t.id ? "https://x.com/" + handle + "/status/" + t.id : null;
+    const profileUrl = handle ? "https://x.com/" + handle : null;
+    const images = Array.isArray(t.media)
+      ? t.media.filter(function(m) { return m && (m.type === "photo" || m.type === "image") && (m.url || m.previewUrl); }).map(function(m) {
+          return {
+            url: m.url || m.previewUrl,
+            thumbnailUrl: m.previewUrl || m.url,
+            altText: m.alt || m.altText || m.alt_text || "",
+            width: m.width || null,
+            height: m.height || null
+          };
+        })
+      : [];
+    return {
+      id: String(t.id),
+      author: handle,
+      authorName: (t.author && t.author.name) || null,
+      text: String(t.text || "").trim(),
+      createdAt: t.createdAt || null,
+      likeCount: t.likeCount || 0,
+      retweetCount: t.retweetCount || 0,
+      replyCount: t.replyCount || 0,
+      url: tweetUrl || profileUrl,
+      tweetUrl,
+      profileUrl,
+      images,
+      urlCards: []
+    };
+  }).filter(function(p) { return p.text; });
+}
+
+const BIRD_BIN = process.env.BIRD_BIN || "bird";
+function bird(args, timeoutMs = 30000) { return run(BIRD_BIN, args, { timeout: timeoutMs }); }
+function birdAuthStatus() {
+  const r = bird(["whoami", "--plain"], 15000);
+  const blob = (r.stdout + " " + r.stderr);
+  // `bird whoami` prints "🙋 @handle (name)" + the user id when auth works.
+  const handleMatch = blob.match(/@([A-Za-z0-9_]{1,15})\b/);
+  const ok = r.ok && !!handleMatch && !/Make sure you are logged into x\.com/i.test(r.stdout);
+  return { ok, handle: handleMatch ? handleMatch[1] : null, message: blob.trim().slice(0, 400) };
+}
+
+function viralFetch(sourceId) {
+  const store = readStore();
+  const source = store.sources.find(function(s) { return s.id === sourceId; });
+  if (!source) throw new Error("source not found: " + sourceId);
+  if (source.kind !== "viral") throw new Error("viral-fetch only valid for viral sources");
+  const c = source.config || {};
+  const filter = String(c.filter || "");
+  const limit = Math.min(100, Math.max(5, Number(c.limit || 40)));
+  const resource = c.resource || "home";
+
+  // Real X data via `bird` (Twitter GraphQL with logged-in browser cookies). Local Birdclaw
+  // SQLite fixtures are off-limits — they ship pre-seeded and aren't real tweets.
+  const auth = birdAuthStatus();
+  if (!auth.ok) {
+    throw new Error("Not logged in to X in your browser. Open https://x.com in Chrome/Firefox and log in, then click Fetch viral feed again. bird says: " + auth.message);
+  }
+
+  let result, endpointLabel;
+  if (filter) {
+    result = bird(["search", filter, "-n", String(limit), "--json"], 45000);
+    endpointLabel = "bird search";
+  } else if (resource === "following") {
+    result = bird(["home", "-n", String(limit), "--following", "--json"], 45000);
+    endpointLabel = "bird home --following";
+  } else {
+    result = bird(["home", "-n", String(limit), "--json"], 45000);
+    endpointLabel = "bird home (For You)";
+  }
+  if (!result.ok && !result.stdout.trim()) {
+    throw new Error("bird fetch failed: " + (result.stderr.trim() || result.error || "command failed"));
+  }
+  const items = safeJson(result.stdout.trim());
+  if (!Array.isArray(items)) {
+    throw new Error("Unexpected response from bird (not an array). First 200 chars: " + String(result.stdout).slice(0, 200));
+  }
+  const posts = mapBirdItems(items);
+  const snapshot = {
+    id: makeId("feed"),
+    createdAt: nowIso(),
+    filter,
+    resource,
+    limit,
+    transport: { tool: "bird", endpoint: endpointLabel, ok: result.ok, status: result.status, error: result.error, stderr: result.stderr.trim() },
+    sampleCount: posts.length,
+    posts: posts.slice(0, 60)
+  };
+  const s2 = readStore();
+  const src = s2.sources.find(function(s) { return s.id === sourceId; });
+  if (!src) throw new Error("source disappeared during viral fetch: " + sourceId);
+  src.lastFeedSnapshot = snapshot;
+  src.lastFeedSnapshotId = snapshot.id;
+  src.updatedAt = nowIso();
+  writeStore(s2);
+  return snapshot;
+}
+
+function generateForSource(sourceId, opts) {
+  opts = opts || {};
+  const store = readStore();
+  const source = store.sources.find(function(s) { return s.id === sourceId; });
+  if (!source) throw new Error("source not found: " + sourceId);
+  const profile = store.profileSnapshots[0] || null;
+  let count = Number(opts.count || 5);
+  if (!Number.isFinite(count) || count <= 0) count = 5;
+  let drafts;
+  let meta = null;
+  let llmUsed = false;
+  if (source.kind === "topic") {
+    const inputs = callLlmForDrafts(buildTopicGenPrompt(source, profile, count), count);
+    let arr;
+    if (inputs && inputs.length) {
+      llmUsed = true;
+      meta = inputs._meta || null;
+      arr = inputs;
+    } else {
+      arr = makeDirectionTexts(adaptTopicToDirection(source), profile, count);
+    }
+    arr.forEach(function(p) {
+      p.sourceId = source.id;
+      p.generationSource = "topic";
+      p.directionId = source.id; // back-compat
+      if (!p.topic) p.topic = source.name;
+    });
+    drafts = arr;
+  } else {
+    const snap = source.lastFeedSnapshot;
+    if (!snap || !Array.isArray(snap.posts) || !snap.posts.length) throw new Error("fetch the viral feed first");
+    const selectedIds = Array.isArray(opts.selectedPostIds) ? opts.selectedPostIds : [];
+    const selected = selectedIds.length
+      ? snap.posts.filter(function(p) { return selectedIds.indexOf(p.id) !== -1; })
+      : snap.posts.slice(0, count);
+    if (!selected.length) throw new Error("no posts selected");
+    const need = selected.length;
+    const inputs = callLlmForDrafts(buildViralGenPrompt(source.name, selected, profile, need), need);
+    let arr;
+    if (inputs && inputs.length) {
+      llmUsed = true;
+      meta = inputs._meta || null;
+      arr = inputs;
+    } else {
+      arr = makeFeedInspiredTexts(selected, source.name, profile, need);
+    }
+    arr.forEach(function(p, i) {
+      p.sourceId = source.id;
+      p.generationSource = "viral";
+      const insp = (function() {
+        const idx = Number(p.inspirationIndex);
+        if (Number.isFinite(idx) && idx >= 1 && idx <= selected.length) return selected[idx - 1];
+        return selected[i] || selected[0];
+      })();
+      if (insp) {
+        p.inspirationPosts = [{ id: insp.id, author: insp.author, text: String(insp.text || "").slice(0, 200), url: insp.url }];
+      }
+      if (!p.topic) p.topic = source.name;
+    });
+    drafts = arr;
+  }
+  const finalDrafts = drafts.map(normalizePost);
+  const s2 = readStore();
+  finalDrafts.forEach(function(d) { s2.posts.unshift(d); });
+  s2.generationSnapshots.unshift({
+    id: makeId("generation"),
+    createdAt: nowIso(),
+    sourceId: source.id,
+    sourceKind: source.kind,
+    profileSnapshotId: profile ? profile.id : null,
+    postIds: finalDrafts.map(function(d) { return d.id; }),
+    count: finalDrafts.length,
+    llmUsed,
+    costUsd: meta ? meta.costUsd : 0,
+    durationMs: meta ? meta.durationMs : 0
+  });
+  s2.generationSnapshots = s2.generationSnapshots.slice(0, 50);
+  // refresh source.updatedAt
+  const src2 = s2.sources.find(function(s) { return s.id === sourceId; });
+  if (src2) src2.updatedAt = nowIso();
+  writeStore(s2);
+  return { source: src2 || source, posts: finalDrafts, llmUsed, costUsd: meta ? meta.costUsd : 0, durationMs: meta ? meta.durationMs : 0 };
+}
+
+function listSources(filterKind) {
+  const sources = readStore().sources;
+  if (filterKind) return sources.filter(function(s) { return s.kind === filterKind; });
+  return sources;
+}
+
+function getSource(id) {
+  const source = readStore().sources.find(function(s) { return s.id === id; });
+  if (!source) throw new Error("source not found: " + id);
+  return source;
+}
+
+function createSource(input) {
+  const kind = input.kind === "viral" ? "viral" : (input.kind === "topic" ? "topic" : null);
+  if (!kind) throw new Error("kind must be 'topic' or 'viral'");
+  const name = String(input.name || "").trim();
+  if (!name) throw new Error("name is required");
+  const config = input.config || {};
+  let normalizedConfig;
+  if (kind === "topic") {
+    normalizedConfig = {
+      angle: String(config.angle || "").trim(),
+      seedNotes: String(config.seedNotes || "").trim(),
+      useTweetVoice: config.useTweetVoice !== false
+    };
+  } else {
+    let limit = Number(config.limit);
+    if (!Number.isFinite(limit) || limit <= 0) limit = 40;
+    if (limit > 200) limit = 200;
+    const resource = ["home", "following", "for-you"].indexOf(config.resource) !== -1 ? config.resource : "home";
+    normalizedConfig = {
+      filter: String(config.filter || "").trim(),
+      resource,
+      limit
+    };
+  }
+  const source = {
+    id: makeId(kind === "topic" ? "src_topic" : "src_viral"),
+    kind,
+    name,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    config: normalizedConfig
+  };
+  if (kind === "topic") (source as any).research = null;
+  const store = readStore();
+  store.sources.unshift(source);
+  writeStore(store);
+  return source;
+}
+
+function updateSource(id, updates) {
+  const store = readStore();
+  const source = store.sources.find(function(s) { return s.id === id; });
+  if (!source) throw new Error("source not found: " + id);
+  if (updates.name !== undefined && String(updates.name).trim()) source.name = String(updates.name).trim();
+  if (updates.archived !== undefined) source.archived = Boolean(updates.archived);
+  if (updates.config && typeof updates.config === "object") {
+    const c = source.config || {};
+    if (source.kind === "topic") {
+      if (updates.config.angle !== undefined) c.angle = String(updates.config.angle || "").trim();
+      if (updates.config.seedNotes !== undefined) c.seedNotes = String(updates.config.seedNotes || "");
+      if (updates.config.useTweetVoice !== undefined) c.useTweetVoice = Boolean(updates.config.useTweetVoice);
+    } else {
+      if (updates.config.filter !== undefined) c.filter = String(updates.config.filter || "").trim();
+      if (updates.config.resource !== undefined && ["home", "following", "for-you"].indexOf(updates.config.resource) !== -1) c.resource = updates.config.resource;
+      if (updates.config.limit !== undefined) {
+        let lim = Number(updates.config.limit);
+        if (Number.isFinite(lim) && lim > 0) { if (lim > 200) lim = 200; c.limit = lim; }
+      }
+    }
+    source.config = c;
+  }
+  source.updatedAt = nowIso();
+  writeStore(store);
+  return source;
+}
+
+function deleteSource(id) {
+  const store = readStore();
+  const idx = store.sources.findIndex(function(s) { return s.id === id; });
+  if (idx === -1) throw new Error("source not found: " + id);
+  let orphaned = 0;
+  for (const p of store.posts || []) {
+    if (p.sourceId === id) {
+      p.sourceId = null;
+      p.updatedAt = nowIso();
+      orphaned += 1;
+    }
+  }
+  store.sources.splice(idx, 1);
+  writeStore(store);
+  return { deleted: id, orphanedPostCount: orphaned };
+}
+
+function getPostsForSource(id) {
+  return readStore().posts.filter(function(p) { return p.sourceId === id; });
+}
+
 function learnProfile(opts) {
   const handle = opts.values.handle || DEFAULT_PROFILE_HANDLE;
   const limit = opts.values.limit || DEFAULT_PROFILE_LIMIT;
@@ -522,111 +1092,6 @@ function makeGeneratedTexts(area, trendSnapshot, profileSnapshot, count) {
   });
 }
 
-function generatePosts(opts) {
-  const store = readStore();
-  const area = String(opts.values.area || store.strategy.contentArea || opts.values.topic || "").trim();
-  if (!area) throw new Error("posting area is required");
-  const count = Number(opts.values.count || 5);
-  if (opts.values.saveArea !== false) {
-    store.strategy = { ...(store.strategy || {}), contentArea: area, updatedAt: nowIso() };
-    writeStore(store);
-  }
-  const trendSnapshot = runTrends({ values: { topic: area, limit: String(opts.values.limit || 40), resource: opts.values.resource || "home" } });
-  const latestProfile = readStore().profileSnapshots[0] || null;
-  const drafts = makeGeneratedTexts(area, trendSnapshot, latestProfile, count).map(savePost);
-  const generation = {
-    id: makeId("generation"),
-    createdAt: nowIso(),
-    area,
-    count: drafts.length,
-    trendSnapshotId: trendSnapshot.id,
-    profileSnapshotId: latestProfile ? latestProfile.id : null,
-    postIds: drafts.map(function(post) { return post.id; }),
-    note: "Generated local draft candidates. Ask OpenClaw to rewrite/improve for final voice before posting."
-  };
-  const fresh = readStore();
-  fresh.generationSnapshots.unshift(generation);
-  fresh.generationSnapshots = fresh.generationSnapshots.slice(0, 50);
-  writeStore(fresh);
-  return { generation, trendSnapshot, posts: drafts };
-}
-
-function fetchFeedSnapshot(opts) {
-  const topic = opts.topic || "";
-  const limit = opts.limit || "40";
-  const resource = opts.resource || "home";
-  const args = ["--json", "search", "tweets", "--resource", resource, "--hide-low-quality", "--originals-only", "--limit", String(limit)];
-  if (topic) args.push(topic);
-  const result = birdclaw(args);
-  if (!result.ok && !result.stdout.trim()) {
-    throw new Error("Birdclaw feed fetch failed: " + (result.stderr.trim() || result.error || "command failed"));
-  }
-  const rawItems = parseJsonLinesOrArray(result.stdout);
-  const posts = rawItems.map(function(item) {
-    return {
-      id: item.id || item.tweetId || item.tweet_id || item.url || makeId("fp"),
-      author: tweetAuthor(item),
-      text: tweetText(item),
-      createdAt: item.createdAt || item.created_at || item.date || null,
-      url: item.url || item.permalink || null
-    };
-  }).filter(function(item) { return item.text; });
-  const snapshot = {
-    id: makeId("feed"),
-    createdAt: nowIso(),
-    topic,
-    resource,
-    limit: Number(limit),
-    birdclaw: { ok: result.ok, status: result.status, error: result.error, stderr: result.stderr.trim() },
-    sampleCount: posts.length,
-    posts: posts.slice(0, 60)
-  };
-  const store = readStore();
-  store.feedSnapshots.unshift(snapshot);
-  store.feedSnapshots = store.feedSnapshots.slice(0, 20);
-  writeStore(store);
-  return snapshot;
-}
-
-function saveDirection(input) {
-  if (!String(input.name || "").trim()) throw new Error("topic name is required");
-  const store = readStore();
-  const direction = {
-    id: makeId("dir"),
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
-    name: String(input.name).trim(),
-    description: String(input.description || "").trim(),
-    references: Array.isArray(input.references) ? input.references.filter(Boolean) : (input.references ? [String(input.references)] : []),
-    useTweetSamples: input.useTweetSamples !== false
-  };
-  store.directions.unshift(direction);
-  writeStore(store);
-  return direction;
-}
-
-function updateDirection(id, updates) {
-  const store = readStore();
-  const direction = store.directions.find(function(d) { return d.id === id; });
-  if (!direction) throw new Error("topic not found: " + id);
-  if (updates.name !== undefined && String(updates.name).trim()) direction.name = String(updates.name).trim();
-  if (updates.description !== undefined) direction.description = String(updates.description).trim();
-  if (updates.references !== undefined) direction.references = Array.isArray(updates.references) ? updates.references.filter(Boolean) : (updates.references ? [String(updates.references)] : []);
-  if (updates.useTweetSamples !== undefined) direction.useTweetSamples = Boolean(updates.useTweetSamples);
-  direction.updatedAt = nowIso();
-  writeStore(store);
-  return direction;
-}
-
-function deleteDirection(id) {
-  const store = readStore();
-  const idx = store.directions.findIndex(function(d) { return d.id === id; });
-  if (idx === -1) throw new Error("topic not found: " + id);
-  store.directions.splice(idx, 1);
-  writeStore(store);
-  return { deleted: id };
-}
-
 function makeFeedInspiredTexts(selectedPosts, area, profileSnapshot, count) {
   const parts = splitArea(area);
   const topic = parts.topic;
@@ -711,73 +1176,6 @@ function makeDirectionTexts(direction, profileSnapshot, count) {
   });
 }
 
-function generateFromFeed(body) {
-  const store = readStore();
-  const area = String(body.area || store.strategy.contentArea || "").trim();
-  if (!area) throw new Error("posting area is required");
-  const feedSnapshotId = body.feedSnapshotId;
-  const feedSnapshot = feedSnapshotId
-    ? store.feedSnapshots.find(function(s) { return s.id === feedSnapshotId; })
-    : store.feedSnapshots[0];
-  if (!feedSnapshot) throw new Error("no trending posts found; fetch trending first");
-  const selectedIds = Array.isArray(body.selectedPostIds) ? body.selectedPostIds : [];
-  const selectedPosts = selectedIds.length
-    ? feedSnapshot.posts.filter(function(p) { return selectedIds.includes(p.id); })
-    : feedSnapshot.posts.slice(0, 5);
-  if (!selectedPosts.length) throw new Error("no posts selected");
-  const count = Number(body.count || selectedPosts.length || 5);
-  const latestProfile = store.profileSnapshots[0] || null;
-  const drafts = makeFeedInspiredTexts(selectedPosts, area, latestProfile, count).map(function(input) {
-    const post = normalizePost(input);
-    store.posts.unshift(post);
-    return post;
-  });
-  const generation = {
-    id: makeId("generation"),
-    createdAt: nowIso(),
-    area,
-    count: drafts.length,
-    trendSnapshotId: feedSnapshot.id,
-    profileSnapshotId: latestProfile ? latestProfile.id : null,
-    postIds: drafts.map(function(post) { return post.id; }),
-    note: "Trending-source generation. Source: " + feedSnapshot.id + ". Ask OpenClaw to rewrite with your voice."
-  };
-  store.generationSnapshots.unshift(generation);
-  store.generationSnapshots = store.generationSnapshots.slice(0, 50);
-  writeStore(store);
-  return { generation, feedSnapshot, posts: drafts };
-}
-
-function generateFromDirection(body) {
-  const store = readStore();
-  const directionId = body.directionId;
-  const direction = directionId
-    ? store.directions.find(function(d) { return d.id === directionId; })
-    : store.directions[0];
-  if (!direction) throw new Error("topic not found; create a topic first");
-  const count = Number(body.count || 5);
-  const latestProfile = store.profileSnapshots[0] || null;
-  const drafts = makeDirectionTexts(direction, latestProfile, count).map(function(input) {
-    const post = normalizePost(input);
-    store.posts.unshift(post);
-    return post;
-  });
-  const generation = {
-    id: makeId("generation"),
-    createdAt: nowIso(),
-    area: direction.name,
-    count: drafts.length,
-    trendSnapshotId: null,
-    profileSnapshotId: latestProfile ? latestProfile.id : null,
-    postIds: drafts.map(function(post) { return post.id; }),
-    note: "Topic-source generation: " + direction.name + ". Ask OpenClaw to rewrite with your voice."
-  };
-  store.generationSnapshots.unshift(generation);
-  store.generationSnapshots = store.generationSnapshots.slice(0, 50);
-  writeStore(store);
-  return { generation, direction, posts: drafts };
-}
-
 function normalizePost(input) {
   const text = String(input.text || "").trim();
   if (!text) throw new Error("post text is required");
@@ -794,6 +1192,7 @@ function normalizePost(input) {
     source: input.source || "openclaw",
     generationSource: input.generationSource || input.source || "openclaw",
     inspirationPosts: input.inspirationPosts || [],
+    sourceId: input.sourceId || null,
     directionId: input.directionId || null,
     postedAt: input.postedAt || null,
     postResult: input.postResult || null
@@ -828,6 +1227,17 @@ function updatePost(postId, updates) {
   return post;
 }
 
+function deletePost(postId) {
+  const store = readStore();
+  const index = store.posts.findIndex(function(item) {
+    return item.id === postId;
+  });
+  if (index === -1) throw new Error("post not found: " + postId);
+  const deleted = store.posts.splice(index, 1)[0];
+  writeStore(store);
+  return { deleted: deleted.id };
+}
+
 function importJson(filePath) {
   const payload = JSON.parse(readFileSync(filePath, "utf8"));
   const rows = Array.isArray(payload) ? payload : payload.posts || [];
@@ -838,14 +1248,18 @@ function importJson(filePath) {
 function postToX(postId, account) {
   const store = readStore();
   const post = findPost(store, postId);
-  const result = birdclaw(["compose", "post", "--account", account || DEFAULT_ACCOUNT, post.text]);
+  const result = birdclaw(["--json", "compose", "post", "--account", account || DEFAULT_ACCOUNT, post.text]);
+  const payload: any = result.stdout.trim() ? safeJson(result.stdout.trim()) : null;
+  const transport = payload && typeof payload === "object" ? payload.transport : null;
+  const liveOk = result.ok && (!transport || transport.ok !== false);
   post.updatedAt = nowIso();
-  post.postResult = { at: nowIso(), account: account || DEFAULT_ACCOUNT, ok: result.ok, status: result.status, stdout: result.stdout.trim(), stderr: result.stderr.trim(), error: result.error };
-  if (result.ok) {
+  post.postResult = { at: nowIso(), account: account || DEFAULT_ACCOUNT, ok: liveOk, status: result.status, stdout: result.stdout.trim(), stderr: result.stderr.trim(), error: result.error, transport };
+  if (liveOk) {
     post.status = "posted";
     post.postedAt = nowIso();
   } else {
     post.status = "post_failed";
+    if (transport && transport.output) post.postResult.error = transport.output;
   }
   writeStore(store);
   return post;
@@ -863,9 +1277,18 @@ function addRewriteRequest(postId, instruction) {
 }
 
 function doctor(json) {
-  const birdVersion = birdclaw(["--version"]);
-  const auth = birdclaw(["auth", "status", "--json"]);
-  output({ storePath: STORE_PATH, node: process.version, birdclaw: { installed: birdVersion.ok, version: birdVersion.stdout.trim(), authOk: auth.ok, auth: auth.stdout.trim() ? safeJson(auth.stdout.trim()) : null, stderr: auth.stderr.trim() } }, json);
+  const birdclawVersion = birdclaw(["--version"]);
+  const birdclawAuth = birdclaw(["auth", "status", "--json"]);
+  const birdVersion = bird(["--version"], 10000);
+  const birdAuth = birdAuthStatus();
+  const claudeVersion = run(CLAUDE_BIN, ["--version"], { timeout: 10000 });
+  output({
+    storePath: STORE_PATH,
+    node: process.version,
+    birdclaw: { installed: birdclawVersion.ok, version: birdclawVersion.stdout.trim(), authOk: birdclawAuth.ok, auth: birdclawAuth.stdout.trim() ? safeJson(birdclawAuth.stdout.trim()) : null, stderr: birdclawAuth.stderr.trim(), note: "Used for posting drafts via Birdclaw. Viral feed reads come via bird." },
+    bird: { installed: birdVersion.ok, version: birdVersion.stdout.trim(), authOk: birdAuth.ok, handle: birdAuth.handle, status: birdAuth.message, note: birdAuth.ok ? null : "bird reads browser cookies. Log in to x.com in Chrome (or Firefox) so bird can authenticate." },
+    claude: { installed: claudeVersion.ok, bin: CLAUDE_BIN, version: claudeVersion.stdout.trim(), model: CLAUDE_MODEL, error: claudeVersion.error || (claudeVersion.ok ? null : claudeVersion.stderr.trim()), note: claudeVersion.ok ? null : "claude CLI not found - LLM generation will fall back to templates. Set XSQUARED_DISABLE_LLM=1 to silence." }
+  }, json);
 }
 
 function escapeHtml(value) {
@@ -875,193 +1298,391 @@ function escapeHtml(value) {
 }
 
 function html() {
-  const CSS = ":root{color-scheme:light dark;--bg:#FAFAF7;--panel:#FFFFFF;--ink:#0A0A0A;--muted:#6B6B6B;--line:#E5E4DE;--accent:#B8542A;--accent-soft:#F2E3D9;--success:#15803D;--error:#B42318;--info:#1F4E8C;--r-sm:4px;--r-md:6px;--r-lg:8px;--shadow-1:0 1px 0 rgba(10,10,10,.03);--font-ui:'Geist','Geist Sans',ui-sans-serif,system-ui,sans-serif;--font-display:'Fraunces',Georgia,serif;--font-mono:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}@media (prefers-color-scheme:dark){:root{--bg:#0E0E0C;--panel:#161614;--ink:#F5F5F0;--muted:#A3A3A0;--line:#2A2A26;--accent:#C56A3F;--accent-soft:#2A1B14;--shadow-1:0 1px 0 rgba(0,0,0,.4)}}*{box-sizing:border-box}body{margin:0;font-family:var(--font-ui);font-size:14px;line-height:1.5;background:var(--bg);color:var(--ink);font-feature-settings:'ss01','cv11'}header{position:sticky;top:0;z-index:2;background:var(--bg);border-bottom:1px solid var(--line)}.bar{max-width:1180px;margin:0 auto;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{display:flex;align-items:baseline;gap:12px}h1{margin:0;font-family:var(--font-display);font-weight:600;font-size:26px;letter-spacing:-.01em;line-height:1}.brand-mark{color:var(--accent)}.brand-tag{font-family:var(--font-mono);font-size:11px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}.nav-tabs{display:flex;gap:4px}.nav-tab{appearance:none;background:transparent;border:none;border-radius:var(--r-sm);color:var(--muted);font-family:var(--font-ui);font-weight:500;font-size:14px;padding:6px 12px;cursor:pointer;position:relative}.nav-tab:hover{color:var(--ink)}.nav-tab.active{color:var(--ink)}.nav-tab.active::after{content:'';position:absolute;left:12px;right:12px;bottom:-18px;height:2px;background:var(--accent);border-radius:2px}.tools{display:flex;gap:8px}main{max-width:1180px;margin:0 auto;padding:24px;display:grid;grid-template-columns:320px 1fr;gap:24px}button,input,textarea,select{font:inherit}button{font-family:var(--font-ui);border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:var(--r-sm);padding:8px 12px;cursor:pointer;font-weight:500;transition:background 150ms ease-out,border-color 150ms ease-out,color 150ms ease-out,transform 80ms ease-out}button:hover{border-color:var(--ink)}button:active{transform:translateY(1px)}button.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}button.primary:hover{background:#000;border-color:#000}button.accent{background:var(--accent);color:#fff;border-color:var(--accent)}button.accent:hover{background:#9F4823;border-color:#9F4823}button.danger-confirm{background:var(--accent);color:#fff;border-color:var(--accent)}button.ghost{background:transparent;border-color:transparent;color:var(--muted)}button.ghost:hover{color:var(--ink);background:var(--accent-soft);border-color:transparent}button:disabled{opacity:.5;cursor:not-allowed;transform:none}button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,.nav-tab:focus-visible{outline:2px solid var(--accent);outline-offset:2px}input,textarea,select{width:100%;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:var(--r-sm);padding:10px 12px;font-family:var(--font-ui);transition:border-color 150ms ease-out}input:hover,textarea:hover,select:hover{border-color:#B5B5AE}input::placeholder,textarea::placeholder{color:var(--muted);opacity:.7}textarea{min-height:128px;resize:vertical;line-height:1.45}.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:20px;box-shadow:var(--shadow-1)}.panel-head{font-family:var(--font-display);font-weight:500;font-size:13px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);margin:0 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}.side{display:grid;gap:16px;align-self:start;position:sticky;top:84px}.field{display:grid;gap:6px;margin-bottom:12px}.field:last-child{margin-bottom:0}label{color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.01em}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.posts{display:grid;gap:14px}.post,.profile-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:20px;display:grid;gap:12px;box-shadow:var(--shadow-1)}.post textarea{min-height:96px}.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}.metric{border:1px solid var(--line);border-radius:var(--r-sm);padding:12px;background:var(--bg);font-variant-numeric:tabular-nums}.metric b{display:block;font-family:var(--font-display);font-weight:500;font-size:24px;line-height:1.1;letter-spacing:-.01em}.metric span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}.meta{color:var(--muted);font-size:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}.meta time,.meta .ts{font-family:var(--font-mono);font-size:11px}.pill{border:1px solid var(--line);border-radius:9999px;padding:2px 8px;background:var(--panel);font-size:11px;color:var(--muted);font-weight:500}.pill-source{border-color:var(--accent);color:var(--accent)}.pill-status{border-color:var(--ink);color:var(--ink);background:var(--bg);text-transform:lowercase;font-family:var(--font-mono);font-size:10px;letter-spacing:.04em;padding:2px 7px}.pill-status[data-status='posted']{border-color:var(--success);color:var(--success);background:transparent}.pill-status[data-status='failed']{border-color:var(--error);color:var(--error);background:transparent}.score{color:var(--accent);font-variant-numeric:tabular-nums;font-weight:500}.posted{color:var(--success);font-size:12px}.failed{color:var(--error);white-space:pre-wrap;font-size:12px;padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--error)}.trend-list{display:grid;gap:0;font-size:13px;color:var(--ink)}.trend-list span{display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line);padding:6px 0;font-variant-numeric:tabular-nums}.trend-list span:last-child{border-bottom:none}.trend-list b{font-weight:500}.trend-list em{font-style:normal;color:var(--muted);font-family:var(--font-mono);font-size:11px}.sample{white-space:pre-wrap;border-top:1px solid var(--line);padding-top:12px;margin-top:4px;color:var(--ink);line-height:1.55}.empty{color:var(--muted);padding:32px 24px;border:1px solid var(--line);border-radius:var(--r-md);background:var(--panel);display:grid;gap:8px}.empty-title{font-family:var(--font-display);font-weight:500;font-size:18px;color:var(--ink);letter-spacing:-.01em}.empty-body{font-size:13px;line-height:1.5}.status-bar{font-family:var(--font-mono);font-size:11px;color:var(--muted);padding:10px 12px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--line);min-height:38px;display:flex;align-items:center;gap:8px}.status-bar.success{color:var(--success);border-color:var(--success)}.status-bar.failed{color:var(--error);border-color:var(--error);white-space:pre-wrap;align-items:flex-start;line-height:1.4}.status-bar::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-family:var(--font-mono);font-size:11px}.kv dt{color:var(--muted)}.kv dd{margin:0;color:var(--ink)}.operator-state{display:grid;gap:6px;margin-bottom:12px}.operator-state span,.chat-target{font-family:var(--font-mono);font-size:11px;color:var(--muted);word-break:break-word}.chat-log{max-height:220px;overflow:auto;display:grid;gap:8px;margin:10px 0}.chat-msg{border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;background:var(--bg);font-size:12px;white-space:pre-wrap}.chat-msg.user{background:var(--panel);border-color:var(--accent)}.chat-msg.assistant{border-color:var(--line)}.chat-msg.system{color:var(--error);border-color:var(--error)}.chat-role{display:block;font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px}.chat-form textarea{min-height:76px}.source-tabs{display:flex;gap:4px;margin-bottom:12px}.source-tab{flex:1;text-align:center;font-size:12px;padding:6px 8px;border-radius:var(--r-sm);cursor:pointer;border:1px solid var(--line);background:var(--panel);color:var(--muted);font-weight:500;transition:background 150ms ease-out,color 150ms ease-out,border-color 150ms ease-out}.source-tab:hover{color:var(--ink);border-color:var(--muted)}.source-tab.active{background:var(--ink);color:var(--bg);border-color:var(--ink)}.feed-post{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px;cursor:pointer;box-shadow:var(--shadow-1);transition:border-color 150ms ease-out}.feed-post:hover{border-color:var(--muted)}.feed-post.selected{border-color:var(--accent);background:var(--accent-soft)}.feed-post-body{font-size:13px;line-height:1.55;white-space:pre-wrap;margin:6px 0 0}.feed-post-meta{display:flex;gap:8px;align-items:center;font-size:11px;color:var(--muted)}.dir-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px;cursor:pointer;box-shadow:var(--shadow-1);transition:border-color 150ms ease-out}.dir-card:hover{border-color:var(--muted)}.dir-card.active-dir{border-color:var(--accent)}.dir-name{font-weight:500;font-size:14px}.dir-desc{font-size:12px;color:var(--muted);line-height:1.4;margin-top:4px}.dir-meta-row{font-size:11px;color:var(--muted);margin-top:6px;font-family:var(--font-mono)}.sel-bar{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);margin-bottom:12px}.sel-count{font-size:13px;font-weight:500}.feed-grid,.dir-grid{display:grid;gap:10px}.note-block{font-size:12px;color:var(--muted);padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--line)}@media(max-width:820px){main{grid-template-columns:1fr;padding:16px;gap:16px}.side{position:static;top:auto}.bar{padding:14px 16px;gap:12px;flex-wrap:wrap}.nav-tab.active::after{bottom:-14px}}@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}";
+  const CSS = ":root{color-scheme:light dark;--bg:#FAFAF7;--panel:#FFFFFF;--ink:#0A0A0A;--muted:#6B6B6B;--line:#E5E4DE;--accent:#B8542A;--accent-soft:#F2E3D9;--success:#15803D;--error:#B42318;--info:#1F4E8C;--r-sm:4px;--r-md:6px;--r-lg:8px;--shadow-1:0 1px 0 rgba(10,10,10,.03);--shadow-2:0 12px 30px rgba(10,10,10,.12);--font-ui:'Geist','Geist Sans',ui-sans-serif,system-ui,sans-serif;--font-display:'Fraunces',Georgia,serif;--font-mono:'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace}@media (prefers-color-scheme:dark){:root{--bg:#0E0E0C;--panel:#161614;--ink:#F5F5F0;--muted:#A3A3A0;--line:#2A2A26;--accent:#C56A3F;--accent-soft:#2A1B14;--shadow-1:0 1px 0 rgba(0,0,0,.4);--shadow-2:0 12px 30px rgba(0,0,0,.5)}}*{box-sizing:border-box}body{margin:0;padding-bottom:92px;font-family:var(--font-ui);font-size:14px;line-height:1.5;background:var(--bg);color:var(--ink);font-feature-settings:'ss01','cv11'}header{position:sticky;top:0;z-index:2;background:var(--bg);border-bottom:1px solid var(--line)}.bar{max-width:1180px;margin:0 auto;padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px}.brand{display:flex;align-items:baseline;gap:10px;flex-shrink:0}h1{margin:0;font-family:var(--font-display);font-weight:600;font-size:22px;letter-spacing:-.01em;line-height:1}.brand-mark{color:var(--accent)}.brand-tag{font-family:var(--font-mono);font-size:11px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}.source-tabs{display:flex;gap:2px;overflow-x:auto;scroll-snap-type:x mandatory;flex:1;min-width:0;align-items:center;scrollbar-width:none;-ms-overflow-style:none}.source-tabs::-webkit-scrollbar{display:none}.tab-pill{appearance:none;background:transparent;border:none;color:var(--muted);font-family:var(--font-ui);font-weight:500;font-size:13px;padding:8px 12px;cursor:pointer;position:relative;display:inline-flex;align-items:center;gap:6px;white-space:nowrap;scroll-snap-align:start;border-radius:0}.tab-pill:hover{color:var(--ink)}.tab-pill.active{color:var(--ink)}.tab-pill.active::after{content:'';position:absolute;left:8px;right:8px;bottom:-8px;height:2px;background:var(--accent)}.tab-pill .kind-pill{font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:.06em;border:1px solid var(--line);border-radius:9999px;padding:1px 6px;color:var(--muted);background:var(--panel)}.tab-new{appearance:none;background:transparent;border:1px dashed var(--line);color:var(--muted);font-family:var(--font-ui);font-weight:500;font-size:12px;padding:6px 10px;cursor:pointer;border-radius:var(--r-sm);white-space:nowrap;flex-shrink:0}.tab-new:hover{color:var(--ink);border-color:var(--ink);border-style:solid}.tools{display:flex;gap:4px;align-items:center;flex-shrink:0}.tools .nav-link{appearance:none;background:transparent;border:none;color:var(--muted);font-size:12px;padding:6px 8px;cursor:pointer;font-family:var(--font-ui);font-weight:500;border-radius:var(--r-sm)}.tools .nav-link:hover{color:var(--ink)}.tools .nav-link.active{color:var(--ink)}main{max-width:1180px;margin:0 auto;padding:24px;display:block;overflow-x:hidden}button,input,textarea,select{font:inherit}button{font-family:var(--font-ui);border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:var(--r-sm);padding:8px 12px;cursor:pointer;font-weight:500;transition:background 150ms ease-out,border-color 150ms ease-out,color 150ms ease-out,transform 80ms ease-out;display:inline-flex;align-items:center;justify-content:center;gap:6px}button:hover{border-color:var(--ink)}button:active{transform:translateY(1px)}button.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}button.primary:hover{background:#000;border-color:#000}button.accent{background:var(--accent);color:#fff;border-color:var(--accent)}button.accent:hover{background:#9F4823;border-color:#9F4823}button.danger-confirm{background:var(--accent);color:#fff;border-color:var(--accent)}button.ghost{background:transparent;border-color:transparent;color:var(--muted)}button.ghost:hover{color:var(--ink);background:var(--accent-soft);border-color:transparent}button:disabled{opacity:.55;cursor:not-allowed;transform:none}button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,.tab-pill:focus-visible{outline:2px solid var(--accent);outline-offset:2px}input,textarea,select{width:100%;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:var(--r-sm);padding:10px 12px;font-family:var(--font-ui);transition:border-color 150ms ease-out}input:hover,textarea:hover,select:hover{border-color:#B5B5AE}input::placeholder,textarea::placeholder{color:var(--muted);opacity:.7}textarea{min-height:96px;resize:vertical;line-height:1.45}.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:20px;margin-bottom:16px;box-shadow:var(--shadow-1)}.panel-head{font-family:var(--font-display);font-weight:500;font-size:13px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);margin:0 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}.field{display:grid;gap:6px;margin-bottom:12px}.field:last-child{margin-bottom:0}label{color:var(--muted);font-size:12px;font-weight:500;letter-spacing:.01em}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.posts{display:grid;gap:14px}.post,.profile-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:20px;display:grid;gap:12px;box-shadow:var(--shadow-1)}.post textarea{min-height:96px}.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}.metric{border:1px solid var(--line);border-radius:var(--r-sm);padding:12px;background:var(--bg);font-variant-numeric:tabular-nums}.metric b{display:block;font-family:var(--font-display);font-weight:500;font-size:24px;line-height:1.1;letter-spacing:-.01em}.metric span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}.meta{color:var(--muted);font-size:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}.meta time,.meta .ts{font-family:var(--font-mono);font-size:11px}.pill{border:1px solid var(--line);border-radius:9999px;padding:2px 8px;background:var(--panel);font-size:11px;color:var(--muted);font-weight:500}.pill-source{border-color:var(--accent);color:var(--accent)}.pill-status{border-color:var(--ink);color:var(--ink);background:var(--bg);text-transform:lowercase;font-family:var(--font-mono);font-size:10px;letter-spacing:.04em;padding:2px 7px}.pill-status[data-status='posted']{border-color:var(--success);color:var(--success);background:transparent}.pill-status[data-status='failed']{border-color:var(--error);color:var(--error);background:transparent}.pill-status[data-status='rewrite_requested']{border-color:var(--info);color:var(--info);background:transparent}.score{color:var(--accent);font-variant-numeric:tabular-nums;font-weight:500}.posted{color:var(--success);font-size:12px}.failed{color:var(--error);white-space:pre-wrap;font-size:12px;padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--error)}.trend-list{display:grid;gap:0;font-size:13px;color:var(--ink)}.trend-list span{display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line);padding:6px 0;font-variant-numeric:tabular-nums}.trend-list span:last-child{border-bottom:none}.trend-list b{font-weight:500}.trend-list em{font-style:normal;color:var(--muted);font-family:var(--font-mono);font-size:11px}.sample{white-space:pre-wrap;border-top:1px solid var(--line);padding-top:12px;margin-top:4px;color:var(--ink);line-height:1.55}.empty{color:var(--muted);padding:32px 24px;border:1px solid var(--line);border-radius:var(--r-md);background:var(--panel);display:grid;gap:8px}.empty-title{font-family:var(--font-display);font-weight:500;font-size:18px;color:var(--ink);letter-spacing:-.01em}.empty-body{font-size:13px;line-height:1.5}.empty-hero{padding:48px 32px;text-align:left;display:grid;gap:14px;max-width:560px;margin:24px auto}.empty-hero h2{font-family:var(--font-display);font-weight:600;font-size:32px;letter-spacing:-.02em;margin:0;color:var(--ink)}.empty-hero p{margin:0;color:var(--muted);line-height:1.55}.empty-hero .row{margin-top:8px;gap:10px}.status-bar{font-family:var(--font-mono);font-size:11px;color:var(--muted);padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--line);min-height:32px;display:none;align-items:center;gap:8px}.status-bar.success{display:flex;color:var(--success);border-color:var(--success)}.status-bar.failed{display:flex;color:var(--error);border-color:var(--error);white-space:pre-wrap;align-items:flex-start;line-height:1.4}.status-bar.show{display:flex}.status-bar::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}.src-view{display:grid;grid-template-columns:320px 1fr;gap:24px;align-items:start}.src-side{position:sticky;top:80px;display:grid;gap:12px;align-self:start}.src-main{min-width:0;display:grid;gap:16px}.config-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);box-shadow:var(--shadow-1)}.config-card>summary{list-style:none;padding:14px 18px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-family:var(--font-display);font-weight:500;font-size:13px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}.config-card>summary::-webkit-details-marker{display:none}.config-card>summary::after{content:'+';font-family:var(--font-mono);color:var(--muted)}.config-card[open]>summary::after{content:'\\2013'}.config-body{padding:0 18px 18px}.cta-stack{display:grid;gap:8px}.cta-sub{font-family:var(--font-mono);font-size:10px;color:var(--muted);text-align:center;margin-top:-2px}.spinner{width:12px;height:12px;border-radius:50%;border:1.5px solid currentColor;border-right-color:transparent;animation:spin .6s linear infinite;display:inline-block}@keyframes spin{to{transform:rotate(360deg)}}.research-meta{font-family:var(--font-mono);font-size:11px;color:var(--muted);display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}.research-section{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}.research-section:first-of-type{border-top:0;padding-top:0;margin-top:0}.research-section>summary{cursor:pointer;font-weight:500;font-size:13px;color:var(--ink);padding:6px 0;list-style:none;display:flex;justify-content:space-between;align-items:center}.research-section>summary::-webkit-details-marker{display:none}.research-section>summary::after{content:'+';font-family:var(--font-mono);color:var(--muted);font-size:12px}.research-section[open]>summary::after{content:'\\2013'}.fact-list{margin:8px 0 0;padding-left:20px;display:grid;gap:6px;font-size:13px;line-height:1.5}.fact-cite{font-family:var(--font-mono);font-size:10px;color:var(--accent);vertical-align:super;margin-left:2px}.link-list{display:grid;gap:10px;margin-top:8px}.link-item{display:grid;gap:2px;padding:8px 10px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--bg)}.link-item a{color:var(--ink);text-decoration:none;font-weight:500;font-size:13px;line-height:1.35}.link-item a:hover{color:var(--accent)}.link-item .snippet{font-size:12px;color:var(--muted);line-height:1.4}.link-item .host{font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:lowercase;letter-spacing:.04em}.summary-list{margin:8px 0 0;padding-left:20px;display:grid;gap:6px;font-size:13px;line-height:1.5}.divider{border:0;border-top:1px solid var(--line);margin:8px 0 0}.main-tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:16px;position:sticky;top:62px;background:var(--bg);z-index:1;padding-top:2px}.main-tab{appearance:none;background:transparent;border:none;border-radius:0;color:var(--muted);font-family:var(--font-ui);font-weight:500;font-size:14px;padding:10px 14px;cursor:pointer;position:relative;display:inline-flex;align-items:center;gap:8px;white-space:nowrap}.main-tab:hover{color:var(--ink);border:none}.main-tab.active{color:var(--ink)}.main-tab.active::after{content:'';position:absolute;left:14px;right:14px;bottom:-1px;height:2px;background:var(--accent)}.main-tab .tab-count{font-family:var(--font-mono);font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:9999px;padding:1px 7px;min-width:18px;text-align:center}.main-tab.active .tab-count{color:var(--ink);border-color:var(--ink)}.main-tab .tab-badge{font-family:var(--font-mono);font-size:10px;background:var(--accent);color:#fff;border-radius:9999px;padding:1px 7px;min-width:16px;text-align:center}.sel-summary{font-family:var(--font-mono);font-size:11px;color:var(--accent);padding:6px 10px;background:var(--accent-soft);border-radius:var(--r-sm);text-align:center;font-weight:500}.viral-tile-engagement{display:flex;gap:12px;font-family:var(--font-mono);font-size:11px;color:var(--muted);border-top:1px solid var(--line);padding-top:6px;margin-top:2px}.viral-tile-engagement span{display:inline-flex;align-items:center;gap:3px}.viral-tile{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:12px 14px;cursor:pointer;display:grid;gap:8px;transition:border-color 150ms ease-out}.viral-tile:hover{border-color:var(--muted)}.viral-tile.selected{border-color:var(--accent);border-width:2px;padding:11px 13px;background:var(--accent-soft)}.viral-tile-body{font-size:13px;line-height:1.5;white-space:pre-wrap}.viral-tile-meta{display:flex;gap:8px;align-items:center;font-size:11px;color:var(--muted)}.viral-tile-meta a:hover{color:var(--accent)}.viral-tile-media{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:4px;border-radius:var(--r-sm);overflow:hidden}.viral-tile-media img{display:block;width:100%;height:100%;max-height:160px;object-fit:cover;border-radius:var(--r-sm);border:1px solid var(--line);background:var(--bg)}.viral-tile-cards{display:grid;gap:6px}.viral-card{display:grid;gap:2px;padding:8px 10px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--bg);text-decoration:none;color:var(--ink);transition:border-color 150ms ease-out}.viral-card:hover{border-color:var(--ink)}.viral-card-title{font-size:12px;font-weight:500;line-height:1.35;color:var(--ink)}.viral-card-host{font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:lowercase;letter-spacing:.04em}.viral-grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}.inspired-by{font-size:11px;color:var(--muted);font-family:var(--font-mono);margin-bottom:-4px}.note-block{font-size:12px;color:var(--muted);padding:8px 10px;background:var(--bg);border-radius:var(--r-sm);border:1px solid var(--line)}.section-head{font-family:var(--font-display);font-size:18px;font-weight:500;letter-spacing:-.01em;margin:0;color:var(--ink)}.section-row{display:flex;justify-content:space-between;align-items:baseline;gap:12px}.modal-overlay{position:fixed;inset:0;background:rgba(10,10,10,.42);display:none;align-items:center;justify-content:center;z-index:10;padding:16px}.modal-overlay.show{display:flex}.modal{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);box-shadow:var(--shadow-2);padding:24px;width:100%;max-width:420px;display:grid;gap:14px}.modal h3{margin:0;font-family:var(--font-display);font-size:20px;font-weight:600;letter-spacing:-.01em}.kind-picker{display:grid;grid-template-columns:1fr 1fr;gap:8px}.kind-option{border:1px solid var(--line);border-radius:var(--r-sm);padding:14px;cursor:pointer;display:grid;gap:4px;text-align:left;background:var(--panel)}.kind-option.selected{border-color:var(--accent);background:var(--accent-soft)}.kind-option b{font-size:13px;color:var(--ink);font-weight:500}.kind-option span{font-size:11px;color:var(--muted);line-height:1.4}.cost-bar{font-family:var(--font-mono);font-size:11px;color:var(--muted);padding:4px 10px;border-radius:var(--r-sm);display:none;align-items:center;gap:6px}.cost-bar.show{display:inline-flex}.chat-dock{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:5;width:min(760px,calc(100vw - 32px));background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);box-shadow:var(--shadow-2);padding:10px;display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center}.chat-dock-head{font-family:var(--font-display);font-weight:500;font-size:13px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:8px;white-space:nowrap}.chat-dock textarea{min-height:42px;height:42px;resize:none}.chat-dock .status-bar{grid-column:1/-1}.chat-log{display:none}@media(max-width:820px){body{padding-bottom:138px}main{padding:16px}.bar{padding:12px 16px;gap:10px;flex-wrap:wrap}.brand h1{font-size:18px}.src-view{grid-template-columns:1fr}.src-side{position:static}.viral-grid{grid-template-columns:1fr}.chat-dock{grid-template-columns:1fr}.chat-dock-head{justify-content:space-between}.chat-dock textarea{height:72px}.empty-hero{padding:24px 8px}.empty-hero h2{font-size:26px}}@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}";
 
-  const HEADER = "<header><div class=\"bar\"><div class=\"brand\"><h1><span class=\"brand-mark\">x</span>squared</h1><span class=\"brand-tag\">drafts</span></div><nav class=\"nav-tabs\" aria-label=\"Primary\"><button class=\"nav-tab active\" data-tab=\"posts\" data-route=\"/posts\">Posts</button><button class=\"nav-tab\" data-tab=\"generate\" data-route=\"/generate\">Generate</button><button class=\"nav-tab\" data-tab=\"profile\" data-route=\"/profile\">Profile</button></nav><div class=\"tools\"><button id=\"doctor\" class=\"ghost\">Doctor</button><button id=\"refresh\" class=\"ghost\">Refresh</button></div></div></header>";
+  const HEADER = "<header><div class=\"bar\"><div class=\"brand\"><h1><span class=\"brand-mark\">x</span>squared</h1><span class=\"brand-tag\">drafts</span></div><div id=\"sourceTabs\" class=\"source-tabs\" role=\"tablist\" aria-label=\"Sources\"></div><div class=\"tools\"><span id=\"costBar\" class=\"cost-bar\" title=\"Latest LLM cost\"></span><button class=\"nav-link\" data-nav=\"profile\" data-route=\"/profile\">Profile</button><button id=\"doctor\" class=\"nav-link\">Doctor</button></div></div></header>";
 
-  const SIDEBAR_POSTS = "";
+  const MODAL_HTML = "<div id=\"newSourceModal\" class=\"modal-overlay\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"newSourceTitle\"><div class=\"modal\"><h3 id=\"newSourceTitle\">New source</h3><p style=\"margin:0;color:var(--muted);font-size:13px;line-height:1.5\">A source is a researched topic you want to post about. We'll pull links and facts on demand, then generate drafts in your voice.</p><div class=\"field\"><label for=\"newSourceName\">Name</label><input id=\"newSourceName\" placeholder=\"e.g. AI agents, Google Ads for SMBs\"></div><div class=\"row\" style=\"justify-content:flex-end\"><button id=\"cancelNewSource\" class=\"ghost\">Cancel</button><button id=\"confirmNewSource\" class=\"primary\">Create</button></div></div></div>";
 
-  const SIDEBAR_GEN = "<div id=\"gen-side\" style=\"display:none\"><section class=\"panel\"><h2 class=\"panel-head\">Source</h2><div class=\"source-tabs\"><button class=\"source-tab active\" data-source=\"direction\">Topic</button><button class=\"source-tab\" data-source=\"feed\">Trending</button></div><div id=\"direction-side\"><button id=\"newDirBtn\" class=\"primary\" style=\"width:100%;margin-bottom:10px\">+ New topic</button><div id=\"dirSideMeta\" style=\"font-size:12px;color:var(--muted);margin-bottom:8px\">Select a topic to generate from it.</div><div id=\"dirGenerateSide\" style=\"display:none\"><button id=\"genFromDirBtn\" class=\"accent\" style=\"width:100%\">Generate topic posts</button></div></div><div id=\"feed-side\" style=\"display:none\"><div class=\"field\"><label>Trending filter</label><input id=\"feedTopic\" placeholder=\"Optional: Google Ads, AI agents...\"></div><div class=\"row\" style=\"margin-bottom:12px\"><button id=\"fetchFeedBtn\" class=\"primary\">Fetch trending posts</button></div><div id=\"feedSideMeta\" style=\"font-size:12px;color:var(--muted)\"></div><div id=\"feedGenerateSide\" style=\"display:none;margin-top:12px\"><div class=\"field\"><label>Your angle / topic</label><input id=\"feedArea\" placeholder=\"Google Ads for small business\"></div><button id=\"genFromFeedBtn\" class=\"accent\" style=\"width:100%\">Generate my versions</button></div></div></section></div>";
-
-  const SIDEBAR_CHAT = "<section class=\"panel\"><h2 class=\"panel-head\">Eigen</h2><div id=\"operatorState\" class=\"operator-state\"></div><div id=\"chatTarget\" class=\"chat-target\">Checking session...</div><div id=\"chatLog\" class=\"chat-log\"></div><div class=\"chat-form\"><textarea id=\"chatInput\" placeholder=\"Ask Eigen about these drafts...\"></textarea><button id=\"chatSend\" class=\"primary\" style=\"width:100%\">Send to this session</button></div><div id=\"status\" class=\"status-bar\" style=\"margin-top:12px\">Ready.</div></section>";
-
-  const CONTENT_GEN = "<div id=\"generate\" style=\"display:none\"><div id=\"gen-dir-view\"><div id=\"dir-editor-card\" class=\"post\" style=\"display:none;margin-bottom:14px\"><div class=\"meta\"><span id=\"dirEditLabel\" class=\"pill\">New topic</span></div><div class=\"field\"><label>Topic name</label><input id=\"dirName\" placeholder=\"Google Ads for small business\"></div><div class=\"field\"><label>Angle / objective</label><textarea id=\"dirDesc\" style=\"min-height:80px\" placeholder=\"What specific angle or claim do you want posts about?\"></textarea></div><div class=\"field\"><label>Reference material</label><textarea id=\"dirRefs\" style=\"min-height:180px\" placeholder=\"Paste notes, research, examples, constraints... Separate multiple references with a line containing only ---\"></textarea></div><div class=\"field\"><label style=\"display:flex;align-items:center;gap:8px;cursor:pointer\"><input type=\"checkbox\" id=\"dirUseTweets\" style=\"width:auto\"> Use learned tweet samples for voice</label></div><div class=\"row\"><button id=\"saveDirBtn\" class=\"primary\">Save topic</button><button id=\"cancelDirBtn\" class=\"ghost\">Cancel</button><button id=\"deleteDirBtn\" class=\"danger-confirm\" style=\"display:none\">Delete</button></div></div><div id=\"dir-grid\" class=\"dir-grid\"></div><div id=\"dir-empty\" class=\"empty\" style=\"display:none\"><div class=\"empty-title\">No topics yet.</div><div class=\"empty-body\">Click <b>+ New topic</b> to define one or many areas you want to post about, then generate drafts for the selected topic.</div></div></div><div id=\"gen-feed-view\" style=\"display:none\"><div id=\"feed-sel-bar\" class=\"sel-bar\" style=\"display:none\"><span class=\"sel-count\" id=\"feedSelCount\">0 selected</span><span style=\"font-size:12px;color:var(--muted)\">Click viral/relevant posts to select · drafts go to Posts tab</span></div><div id=\"feed-posts-grid\" class=\"feed-grid\"></div><div id=\"feed-empty\" class=\"empty\"><div class=\"empty-title\">No trending posts yet.</div><div class=\"empty-body\">Fetch viral or relevant feed posts, select the ones worth recreating, then generate your versions.</div></div></div></div>";
+  const CHAT_DOCK = "<div class=\"chat-dock\"><div class=\"chat-dock-head\">Eigen<span id=\"chatDot\" title=\"Checking session\" style=\"width:8px;height:8px;border-radius:9999px;background:var(--muted);display:inline-block\"></span></div><div id=\"chatLog\" class=\"chat-log\"></div><textarea id=\"chatInput\" placeholder=\"Ask Eigen about these drafts...\"></textarea><button id=\"chatSend\" class=\"primary\">Send</button><div id=\"status\" class=\"status-bar\">Ready.</div></div>";
 
   const JS = `const $=id=>document.getElementById(id);
-let posts=[],profileSnapshots=[],feedSnapshot=null,selectedFeedIds=new Set(),directions=[],activeDirId=null,editingDirId=null,chatMessages=[],chatTarget=null;
+const state={sources:[],activeId:null,view:'sources',posts:[],profileSnapshots:[],selectedFeedIds:new Set(),chatMessages:[],chatTarget:null,lastCost:null};
 const pendingPost=new Map();
-function setStatus(t,c){const e=$('status');e.className='status-bar'+(c?' '+c:'');e.textContent=t}
+const pendingDelete=new Map();
+const pendingDeleteSource=new Map();
+const autosaveTimers=new Map();
+function setStatus(t,c){const e=$('status');e.className='status-bar'+(c?' '+c:'')+((t&&t!=='Ready.')?' show':'');e.textContent=t}
+function setCost(cost){const e=$('costBar');if(cost==null||isNaN(Number(cost))){e.className='cost-bar';e.textContent='';return}e.className='cost-bar show';e.textContent='$'+Number(cost).toFixed(2)}
 async function api(p,o={}){const r=await fetch(p,{headers:{'content-type':'application/json'},...o});const b=await r.json().catch(()=>({}));if(!r.ok)throw new Error(b.error||r.statusText);return b}
 function esc(v){return String(v||'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
 function fmtDate(d){if(!d)return '';const x=new Date(d);const diff=(Date.now()-x.getTime())/1000;if(diff<60)return 'just now';if(diff<3600)return Math.floor(diff/60)+'m ago';if(diff<86400)return Math.floor(diff/3600)+'h ago';if(diff<604800)return Math.floor(diff/86400)+'d ago';return x.toLocaleDateString(undefined,{month:'short',day:'numeric'})}
-function renderPosts(){
-  const root=$('posts');
-  if(!posts.length){root.innerHTML='<div class="empty"><div class="empty-title">No drafts yet.</div><div class="empty-body">Use the <b>Generate</b> tab, then choose <b>Topic</b> or <b>Trending</b>.</div></div>';return}
-  const sl=s=>s||'draft';
-  function postSource(p){const s=p.generationSource||p.source||'';return (s==='trending'||s==='feed-inspired')?'trending':'topic'}
-  function card(p){
-    const st=sl(p.status);
-    const srcPill=(p.generationSource&&p.generationSource!=='openclaw'&&p.generationSource!=='dashboard')?'<span class="pill pill-source">'+esc(p.generationSource)+'</span>':'';
-    return '<article class="post" data-id="'+esc(p.id)+'"><div class="meta"><span class="pill pill-status" data-status="'+esc(st)+'">'+esc(st)+'</span>'+(p.topic?'<span class="pill">'+esc(p.topic)+'</span>':'')+(p.angle?'<span class="pill">'+esc(p.angle)+'</span>':'')+srcPill+(p.score!=null?'<span class="score">'+esc(p.score)+'</span>':'')+'<span class="ts">'+fmtDate(p.updatedAt||p.createdAt)+'</span></div><textarea data-field="text">'+esc(p.text)+'</textarea>'+(p.notes?'<div class="note-block">'+esc(p.notes)+'</div>':'')+'<div class="field"><label>Rewrite request</label><input data-field="rewrite" placeholder="Sharper, more specific, less hype..."></div><div class="row"><button data-action="save">Save</button><button data-action="rewrite">Ask OpenClaw</button><button data-action="post" class="primary">Post to X</button></div>'+(p.postResult&&!p.postResult.ok?'<div class="failed">'+esc(p.postResult.stderr||p.postResult.error||'Post failed')+'</div>':'')+(p.postedAt?'<div class="posted">✓ Posted '+fmtDate(p.postedAt)+'</div>':'')+'</article>';
+function host(u){try{return new URL(u).host.replace(/^www\\./,'')}catch(e){return ''}}
+function spin(label){return '<span class="spinner"></span><span>'+esc(label)+'</span>'}
+function renderPostCard(p){
+  const st=p.status||'draft';
+  const inspired=(p.inspirationPosts&&p.inspirationPosts[0])?p.inspirationPosts[0]:null;
+  const inspLine=inspired?'<div class="inspired-by">inspired by @'+esc(String(inspired.author||'').replace(/^@/,''))+'</div>':'';
+  return '<article class="post" data-id="'+esc(p.id)+'">'+inspLine+'<div class="meta"><span class="pill pill-status" data-status="'+esc(st)+'">'+esc(st)+'</span>'+(p.angle?'<span class="pill">'+esc(p.angle)+'</span>':'')+(p.score!=null?'<span class="score">'+esc(p.score)+'</span>':'')+'<span class="ts">'+fmtDate(p.updatedAt||p.createdAt)+'</span></div><textarea data-field="text">'+esc(p.text)+'</textarea>'+(p.notes?'<div class="note-block">'+esc(p.notes)+'</div>':'')+'<div class="field"><label>Instructions</label><input data-field="rewrite" placeholder="Optional: sharper, more specific, less hype..."></div><div class="row"><button data-action="save">Save</button><button data-action="rewrite">Request rewrite</button><button data-action="delete" class="ghost">Delete</button><button data-action="post" class="primary">Post to X</button></div>'+(p.postResult&&!p.postResult.ok?'<div class="failed">'+esc(p.postResult.stderr||p.postResult.error||'Post failed')+'</div>':'')+(p.postedAt?'<div class="posted">\\u2713 Posted '+fmtDate(p.postedAt)+'</div>':'')+'</article>';
+}
+function renderDraftsForSource(sourceId){
+  const list=state.posts.filter(p=>p.sourceId===sourceId);
+  if(!list.length) return '<div class="empty"><div class="empty-title">No drafts yet.</div><div class="empty-body">Use the actions in the sidebar to generate posts.</div></div>';
+  const groups={draft:[],rewrite_requested:[],posted:[],other:[]};
+  list.forEach(p=>{const s=p.status||'draft';if(groups[s])groups[s].push(p);else groups.other.push(p)});
+  let html='';
+  if(groups.draft.length) html+='<div class="posts">'+groups.draft.map(renderPostCard).join('')+'</div>';
+  if(groups.rewrite_requested.length) html+='<details open class="config-card" style="margin-top:14px"><summary style="padding:12px 16px;font-size:12px">Rewrite requested ('+groups.rewrite_requested.length+')</summary><div style="padding:0 16px 16px"><div class="posts">'+groups.rewrite_requested.map(renderPostCard).join('')+'</div></div></details>';
+  if(groups.other.length) html+='<div class="posts" style="margin-top:14px">'+groups.other.map(renderPostCard).join('')+'</div>';
+  if(groups.posted.length) html+='<details class="config-card" style="margin-top:14px"><summary style="padding:12px 16px;font-size:12px">Posted ('+groups.posted.length+')</summary><div style="padding:0 16px 16px"><div class="posts">'+groups.posted.map(renderPostCard).join('')+'</div></div></details>';
+  return html;
+}
+function configCollapsedKey(srcId){return 'xsq.config.collapsed.'+srcId}
+function isConfigCollapsed(srcId,hasDrafts){const v=localStorage.getItem(configCollapsedKey(srcId));if(v==='1')return true;if(v==='0')return false;return hasDrafts}
+function renderTabs(){
+  const root=$('sourceTabs');
+  const parts=state.sources.map(s=>{
+    const active=s.id===state.activeId&&state.view==='source';
+    return '<button class="tab-pill'+(active?' active':'')+'" data-src="'+esc(s.id)+'" role="tab"><span>'+esc(s.name)+'</span><span class="kind-pill">'+esc(s.kind)+'</span></button>';
+  });
+  parts.push('<button id="newSourceBtn" class="tab-new" type="button">+ New source</button>');
+  root.innerHTML=parts.join('');
+  document.querySelectorAll('.nav-link[data-nav]').forEach(b=>b.classList.toggle('active',state.view===b.dataset.nav));
+}
+function renderTopicView(src){
+  const c=src.config||{};
+  const hasDrafts=state.posts.some(p=>p.sourceId===src.id);
+  const collapsed=isConfigCollapsed(src.id,hasDrafts);
+  const genDisabled=!(src.research||(c.seedNotes&&c.seedNotes.trim()));
+  const r=src.research;
+  let researchInner;
+  if(!r){researchInner='<div style="font-size:13px;color:var(--muted);line-height:1.5">No research yet. Click <b>Run research</b> to gather links + facts.</div>'}
+  else{
+    const factsHtml=(r.facts||[]).map(f=>{const html=esc(f).replace(/\\[(\\d+)\\]/g,'<a class="fact-cite" href="#src-link-'+src.id+'-$1">[$1]</a>');return '<li>'+html+'</li>'}).join('');
+    const summariesHtml=(r.summaries||[]).map(s=>'<li>'+esc(s)+'</li>').join('');
+    const linksHtml=(r.links||[]).map((l,i)=>'<div class="link-item" id="src-link-'+src.id+'-'+(i+1)+'"><a href="'+esc(l.url)+'" target="_blank" rel="noopener">'+esc(l.title||l.url)+'</a>'+(l.snippet?'<div class="snippet">'+esc(l.snippet)+'</div>':'')+'<span class="host">'+(l.url?esc(host(l.url)):'')+'</span></div>').join('');
+    researchInner='<div class="research-meta"><span>Last run '+fmtDate(r.createdAt)+'</span><span>\\u00b7</span><span>$'+Number(r.costUsd||0).toFixed(2)+'</span><span>\\u00b7</span><span>'+(r.links||[]).length+' links</span><span>\\u00b7</span><span>'+(r.durationMs?Math.round(r.durationMs/1000)+'s':'')+'</span></div>'+'<details open class="research-section"><summary>Summaries ('+(r.summaries||[]).length+')</summary><ul class="summary-list">'+(summariesHtml||'<li style="color:var(--muted);list-style:none;margin-left:-20px">No summaries returned.</li>')+'</ul></details>'+'<details class="research-section"><summary>Facts ('+(r.facts||[]).length+')</summary><ol class="fact-list">'+(factsHtml||'<li style="color:var(--muted)">No facts returned.</li>')+'</ol></details>'+'<details class="research-section"><summary>Sources ('+(r.links||[]).length+')</summary><div class="link-list">'+(linksHtml||'<div style="color:var(--muted);font-size:12px">No links returned.</div>')+'</div></details>';
   }
-  function section(title,items,empty){return '<section class="posts"><div class="meta" style="justify-content:space-between;margin:2px 0 4px"><span class="pill pill-source">'+title+'</span><span>'+items.length+' drafts</span></div>'+(items.length?items.map(card).join(''):'<div class="empty"><div class="empty-title">'+empty+'</div></div>')+'</section>'}
-  const topicPosts=posts.filter(p=>postSource(p)==='topic');
-  const trendingPosts=posts.filter(p=>postSource(p)==='trending');
-  root.innerHTML=section('Topic',topicPosts,'No topic drafts yet.')+section('Trending',trendingPosts,'No trending drafts yet.')}
-function metric(label,value){return '<div class="metric"><b>'+esc(value)+'</b><span>'+esc(label)+'</span></div>'}
-function renderProfile(){
-  const root=$('profile');const s=profileSnapshots[0];
-  if(!s){root.innerHTML='<div class="empty"><div class="empty-title">No profile snapshot yet.</div><div class="empty-body">xsquared learns your profile automatically from Birdclaw when this tab loads.</div></div>';return}
+  return '<div class="src-view"><aside class="src-side">'+
+    '<details class="config-card" id="configCard" '+(collapsed?'':'open')+'><summary>Config</summary><div class="config-body">'+
+    '<div class="field"><label for="cfgName">Name</label><input id="cfgName" value="'+esc(src.name)+'"></div>'+
+    '<div class="field"><label for="cfgAngle">Angle / objective</label><input id="cfgAngle" value="'+esc(c.angle||'')+'" placeholder="What angle or claim?"></div>'+
+    '<div class="field"><label for="cfgNotes">Seed notes</label><textarea id="cfgNotes" placeholder="Paste references, constraints, examples...">'+esc(c.seedNotes||'')+'</textarea></div>'+
+    '<div class="field"><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="cfgVoice" '+(c.useTweetVoice!==false?'checked':'')+' style="width:auto"> Use tweet-sample voice</label></div>'+
+    '<div class="row" style="margin-top:8px"><button id="saveCfgBtn" class="primary">Save</button><button id="deleteSrcBtn" class="ghost">Delete</button></div>'+
+    '</div></details>'+
+    '<div class="cta-stack">'+
+      '<button id="runResearchBtn" class="primary" style="width:100%">Run research</button>'+
+      '<div class="cta-sub">~30\\u201390s \\u00b7 ~$0.05\\u20130.25 each</div>'+
+      '<button id="generateBtn" class="accent" style="width:100%;margin-top:8px"'+(genDisabled?' disabled title="Add research or seed notes first"':'')+'>Generate 5 posts</button>'+
+      '<div class="cta-sub">~5\\u201315s</div>'+
+    '</div>'+
+  '</aside><div class="src-main">'+
+    '<section class="panel"><div class="panel-head"><span>Research</span></div>'+researchInner+'</section>'+
+    '<hr class="divider">'+
+    '<div class="section-row"><h2 class="section-head">Drafts ('+state.posts.filter(p=>p.sourceId===src.id).length+')</h2></div>'+
+    '<div id="draftsRoot">'+renderDraftsForSource(src.id)+'</div>'+
+  '</div></div>';
+}
+function viralTabKey(srcId){return 'xsq.viral.tab.'+srcId}
+function getViralTab(srcId,draftCount,feedCount){
+  const stored=localStorage.getItem(viralTabKey(srcId));
+  if(stored==='drafts'||stored==='feed')return stored;
+  // Defaults: have drafts → drafts; otherwise feed (so user can pick + generate).
+  if(draftCount>0)return 'drafts';
+  if(feedCount>0)return 'feed';
+  return 'feed';
+}
+function setViralTab(srcId,tab){localStorage.setItem(viralTabKey(srcId),tab)}
+function renderViralView(src){
+  const c=src.config||{};
+  const draftCount=state.posts.filter(p=>p.sourceId===src.id).length;
+  const hasDrafts=draftCount>0;
+  const collapsed=isConfigCollapsed(src.id,hasDrafts);
+  const snap=src.lastFeedSnapshot;
+  const selN=state.selectedFeedIds.size;
+  const totalN=snap&&snap.posts?snap.posts.length:0;
+  const genDisabled=selN===0;
+  const activeTab=getViralTab(src.id,draftCount,totalN);
+  let feedInner;
+  if(!snap||!snap.posts||!snap.posts.length){feedInner='<div class="empty"><div class="empty-title">No viral feed yet.</div><div class="empty-body">Click <b>Fetch viral feed</b> in the sidebar to pull recent posts.</div></div>'}
+  else{
+    const tiles=snap.posts.map(p=>{
+      const sel=state.selectedFeedIds.has(p.id);
+      const handle=esc(String(p.author||'?').replace(/^@/,''));
+      const tweetHref=p.tweetUrl||p.url||'';
+      const profileHref=p.profileUrl||'';
+      const handleHtml=profileHref?'<a href="'+esc(profileHref)+'" target="_blank" rel="noopener" data-no-toggle style="color:var(--ink);text-decoration:none">@'+handle+'</a>':'<span>@'+handle+'</span>';
+      const dateHtml=p.createdAt?(tweetHref?'<a href="'+esc(tweetHref)+'" target="_blank" rel="noopener" data-no-toggle class="ts" style="color:var(--muted);text-decoration:none">'+fmtDate(p.createdAt)+'</a>':'<span class="ts">'+fmtDate(p.createdAt)+'</span>'):'';
+      const images=Array.isArray(p.images)?p.images.filter(im=>im&&im.url):[];
+      const imgHtml=images.length?'<div class="viral-tile-media">'+images.slice(0,4).map(im=>'<a href="'+esc(tweetHref||im.url)+'" target="_blank" rel="noopener" data-no-toggle><img src="'+esc(im.thumbnailUrl||im.url)+'" alt="'+esc(im.altText||'')+'" loading="lazy"></a>').join('')+'</div>':'';
+      const cards=Array.isArray(p.urlCards)?p.urlCards.filter(c=>c&&c.url):[];
+      const cardHtml=cards.length?'<div class="viral-tile-cards">'+cards.slice(0,2).map(c=>{const host=(()=>{try{return new URL(c.url).hostname.replace(/^www\\./,'')}catch{return ''}})();return '<a href="'+esc(c.url)+'" target="_blank" rel="noopener" data-no-toggle class="viral-card">'+(c.title?'<span class="viral-card-title">'+esc(c.title)+'</span>':'')+'<span class="viral-card-host">'+esc(host||c.displayUrl||c.url)+'</span></a>'}).join('')+'</div>':'';
+      const openHtml=tweetHref?'<a href="'+esc(tweetHref)+'" target="_blank" rel="noopener" data-no-toggle style="margin-left:auto;font-size:11px;color:var(--muted);text-decoration:none">open tweet \\u2197</a>':'';
+      const engagement=(p.likeCount||p.retweetCount||p.replyCount)?'<div class="viral-tile-engagement"><span>\\u2764 '+(p.likeCount||0)+'</span><span>\\u21bb '+(p.retweetCount||0)+'</span><span>\\u{1F4AC} '+(p.replyCount||0)+'</span></div>':'';
+      return '<div class="viral-tile'+(sel?' selected':'')+'" data-fid="'+esc(p.id)+'"><div class="viral-tile-meta">'+handleHtml+dateHtml+openHtml+'</div><div class="viral-tile-body">'+esc(p.text)+'</div>'+imgHtml+cardHtml+engagement+'</div>';
+    }).join('');
+    feedInner='<div class="research-meta"><span>'+selN+' of '+totalN+' selected</span><span>\\u00b7</span><span>click to toggle</span><span>\\u00b7</span><span>fetched '+fmtDate(snap.createdAt)+'</span></div><div class="viral-grid">'+tiles+'</div>';
+  }
+  return '<div class="src-view"><aside class="src-side">'+
+    '<details class="config-card" id="configCard" '+(collapsed?'':'open')+'><summary>Config</summary><div class="config-body">'+
+    '<div class="field"><label for="cfgName">Name</label><input id="cfgName" value="'+esc(src.name)+'"></div>'+
+    '<div class="field"><label for="cfgFilter">Filter</label><input id="cfgFilter" value="'+esc(c.filter||'')+'" placeholder="e.g. AI agents"></div>'+
+    '<div class="field"><label for="cfgResource">Resource</label><select id="cfgResource"><option value="home"'+(c.resource==='home'?' selected':'')+'>home</option><option value="following"'+(c.resource==='following'?' selected':'')+'>following</option><option value="for-you"'+(c.resource==='for-you'?' selected':'')+'>for-you</option></select></div>'+
+    '<div class="field"><label for="cfgLimit">Limit</label><input id="cfgLimit" type="number" value="'+esc(c.limit||40)+'" min="1" max="200"></div>'+
+    '<div class="row" style="margin-top:8px"><button id="saveCfgBtn" class="primary">Save</button><button id="deleteSrcBtn" class="ghost">Delete</button></div>'+
+    '</div></details>'+
+    (totalN?'<div class="sel-summary">'+selN+' of '+totalN+' selected</div>':'')+
+    '<div class="cta-stack">'+
+      '<button id="fetchFeedBtn" class="primary" style="width:100%">'+(snap?'Refresh viral feed':'Fetch viral feed')+'</button>'+
+      '<div class="cta-sub">via bird \\u00b7 your X home feed</div>'+
+      '<button id="generateBtn" class="accent" style="width:100%;margin-top:8px"'+(genDisabled?' disabled title="Select at least one viral post first"':'')+'>Generate '+(selN||'from selected')+' draft'+(selN===1?'':'s')+'</button>'+
+      '<div class="cta-sub">~5\\u201315s</div>'+
+    '</div>'+
+  '</aside><div class="src-main">'+
+    '<div class="main-tabs" role="tablist">'+
+      '<button class="main-tab'+(activeTab==='drafts'?' active':'')+'" data-tab="drafts" role="tab">Drafts <span class="tab-count">'+draftCount+'</span></button>'+
+      '<button class="main-tab'+(activeTab==='feed'?' active':'')+'" data-tab="feed" role="tab">Feed <span class="tab-count">'+totalN+'</span>'+(selN?' <span class="tab-badge">'+selN+'</span>':'')+'</button>'+
+    '</div>'+
+    (activeTab==='drafts'
+      ? '<div id="draftsRoot">'+renderDraftsForSource(src.id)+'</div>'
+      : '<section>'+feedInner+'</section>')+
+  '</div></div>';
+}
+function renderEmpty(){
+  return '<div class="empty-hero"><h2>Start with a topic.</h2><p>A source is a subject you want to post about — like <em>Google Ads for small business</em> or <em>AI agents</em>. We research the topic and draft posts in your voice. Your <b>Viral feed</b> tab is always available for inspiration from recent posts.</p><div class="row"><button class="primary" data-new-source>+ New source</button></div></div>';
+}
+function renderProfileView(){
+  const root=document.createElement('div');root.id='profile';root.className='posts';
+  const s=state.profileSnapshots[0];
+  if(!s){root.innerHTML='<div class="empty"><div class="empty-title">No profile snapshot yet.</div><div class="empty-body">xsquared learns your profile automatically from Birdclaw when this tab loads.</div></div>';return root.outerHTML}
   const p=s.profile||{};const m=p.metrics||{};
-  root.innerHTML='<article class="profile-card"><div class="meta"><span class="pill">'+esc(s.handle||'authored')+'</span><span class="ts">'+fmtDate(s.createdAt)+'</span><span>'+esc(p.sampleCount||0)+' tweets</span></div>'+(s.note?'<div class="failed">'+esc(s.note)+'</div>':'')+'<div class="metric-grid">'+metric('median chars',m.medianChars||0)+metric('median lines',m.medianLines||0)+metric('short posts',String(m.shortPostPct||0)+'%')+metric('links',String(m.linkPct||0)+'%')+metric('questions',String(m.questionPct||0)+'%')+metric('hashtags',String(m.hashtagPct||0)+'%')+'</div><div><b>Style guidance</b><div class="trend-list">'+(p.guidance||[]).map(x=>'<span>'+esc(x)+'</span>').join('')+'</div></div><div><b>Common terms</b><div class="trend-list">'+(((p.terms||{}).terms||[]).slice(0,12).map(t=>'<span><b>'+esc(t.term)+'</b><em>'+t.count+'</em></span>').join('')||'<span>None yet</span>')+'</div></div><div><b>Repeated phrases</b><div class="trend-list">'+((p.phrases||[]).slice(0,12).map(t=>'<span><b>'+esc(t.phrase)+'</b><em>'+t.count+'</em></span>').join('')||'<span>None yet</span>')+'</div></div><div><b>Sample posts</b>'+((p.samples||[]).map(x=>'<div class="sample">'+esc(x.text)+'</div>').join('')||'<div class="sample">No samples.</div>')+'</div></article>'}
-function renderOperator(){
-  const s=profileSnapshots[0];const p=s&&s.profile||{};
-  $('operatorState').innerHTML='<span>Voice: '+esc(p.sampleCount||0)+' tweet samples</span><span>Sources: topic + trending</span><span>Store: .xsquared/store.json</span>';
-  $('chatTarget').textContent=chatTarget&&chatTarget.connected?'Connected: '+(chatTarget.key||chatTarget.sessionId):'Chat not connected';
+  function metric(label,value){return '<div class="metric"><b>'+esc(value)+'</b><span>'+esc(label)+'</span></div>'}
+  root.innerHTML='<article class="profile-card"><div class="meta"><span class="pill">'+esc(s.handle||'authored')+'</span><span class="ts">'+fmtDate(s.createdAt)+'</span><span>'+esc(p.sampleCount||0)+' tweets</span></div>'+(s.note?'<div class="failed">'+esc(s.note)+'</div>':'')+'<div class="metric-grid">'+metric('median chars',m.medianChars||0)+metric('median lines',m.medianLines||0)+metric('short posts',String(m.shortPostPct||0)+'%')+metric('links',String(m.linkPct||0)+'%')+metric('questions',String(m.questionPct||0)+'%')+metric('hashtags',String(m.hashtagPct||0)+'%')+'</div><div><b>Style guidance</b><div class="trend-list">'+(p.guidance||[]).map(x=>'<span>'+esc(x)+'</span>').join('')+'</div></div><div><b>Common terms</b><div class="trend-list">'+(((p.terms||{}).terms||[]).slice(0,12).map(t=>'<span><b>'+esc(t.term)+'</b><em>'+t.count+'</em></span>').join('')||'<span>None yet</span>')+'</div></div><div><b>Repeated phrases</b><div class="trend-list">'+((p.phrases||[]).slice(0,12).map(t=>'<span><b>'+esc(t.phrase)+'</b><em>'+t.count+'</em></span>').join('')||'<span>None yet</span>')+'</div></div><div><b>Sample posts</b>'+((p.samples||[]).map(x=>'<div class="sample">'+esc(x.text)+'</div>').join('')||'<div class="sample">No samples.</div>')+'</div></article>';
+  return root.outerHTML;
 }
-function renderChat(){
-  $('chatLog').innerHTML=chatMessages.length?chatMessages.slice(-8).map(m=>'<div class="chat-msg '+esc(m.role||'system')+'"><span class="chat-role">'+esc(m.role||'system')+'</span>'+esc(m.text||'')+'</div>').join(''):'<div class="chat-msg system"><span class="chat-role">system</span>No UI chat yet.</div>';
-  $('chatLog').scrollTop=$('chatLog').scrollHeight;
+function render(){
+  renderTabs();
+  const root=$('appRoot');
+  if(state.view==='profile'){root.innerHTML=renderProfileView();return}
+  if(!state.sources.length){root.innerHTML=renderEmpty();bindEmpty();return}
+  const src=state.sources.find(s=>s.id===state.activeId);
+  if(!src){root.innerHTML=renderEmpty();bindEmpty();return}
+  root.innerHTML=src.kind==='topic'?renderTopicView(src):renderViralView(src);
+  bindSourceView(src);
 }
-async function loadChat(){const c=await api('/api/chat');chatMessages=c.messages||[];chatTarget=c.target||null;renderOperator();renderChat()}
-async function load(){const d=await api('/api/posts');posts=d.posts;renderPosts();const p=await api('/api/profile');profileSnapshots=p.profileSnapshots;renderProfile();await loadChat().catch(()=>renderOperator())}
-const SIDE_PANELS=[];
-function routeToTab(path){
-  if(path==='/generate')return 'generate';
-  if(path==='/profile')return 'profile';
-  return 'posts';
+function bindEmpty(){
+  document.querySelectorAll('[data-new-source]').forEach(b=>b.onclick=()=>openModal())
 }
-function showTab(name,opts={}){
-  document.querySelectorAll('.nav-tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));
-  $('posts').style.display=name==='posts'?'grid':'none';
-  $('profile').style.display=name==='profile'?'grid':'none';
-  $('generate').style.display=name==='generate'?'':'none';
-  $('gen-side').style.display=name==='generate'?'':'none';
-  SIDE_PANELS.forEach(id=>{const el=$(id);if(el)el.style.display=name==='generate'?'none':''});
-  const route=name==='generate'?'/generate':name==='profile'?'/profile':'/posts';
-  if(!opts.skipHistory&&window.location.pathname!==route) history.pushState({tab:name},'',route);
-  if(name==='generate') loadDirections().catch(()=>{});
+function bindSourceView(src){
+  // config persistence
+  const cc=$('configCard');
+  if(cc){cc.addEventListener('toggle',()=>localStorage.setItem(configCollapsedKey(src.id),cc.open?'0':'1'))}
+  $('saveCfgBtn').onclick=async()=>{
+    const btn=$('saveCfgBtn');const orig=btn.textContent;
+    try{
+      btn.disabled=true;btn.innerHTML=spin('Saving');
+      const name=$('cfgName').value.trim();
+      let config;
+      if(src.kind==='topic'){
+        config={angle:$('cfgAngle').value,seedNotes:$('cfgNotes').value,useTweetVoice:$('cfgVoice').checked};
+      }else{
+        config={filter:$('cfgFilter').value,resource:$('cfgResource').value,limit:Number($('cfgLimit').value)||40};
+      }
+      const updated=await api('/api/sources/'+src.id,{method:'PATCH',body:JSON.stringify({name,config})});
+      const idx=state.sources.findIndex(s=>s.id===src.id);
+      if(idx>=0)state.sources[idx]=updated;
+      setStatus('Saved.','success');
+      render();
+    }catch(e){setStatus(e.message,'failed');btn.disabled=false;btn.textContent=orig}
+  };
+  $('deleteSrcBtn').onclick=async()=>{
+    const btn=$('deleteSrcBtn');
+    if(!pendingDeleteSource.has(src.id)){
+      const orig=btn.textContent;
+      btn.classList.add('danger-confirm');btn.textContent='Click again to delete';
+      const t=setTimeout(()=>{if(pendingDeleteSource.get(src.id)===t){pendingDeleteSource.delete(src.id);btn.classList.remove('danger-confirm');btn.textContent=orig}},6000);
+      pendingDeleteSource.set(src.id,t);
+      setStatus('Confirm: click again within 6s to delete this source.');return;
+    }
+    clearTimeout(pendingDeleteSource.get(src.id));pendingDeleteSource.delete(src.id);
+    btn.innerHTML=spin('Deleting');btn.disabled=true;
+    try{
+      const r=await api('/api/sources/'+src.id,{method:'DELETE'});
+      setStatus('Source deleted'+(r.orphanedPostCount?' \\u00b7 '+r.orphanedPostCount+' drafts kept':''),'success');
+      await reloadSources();
+      const next=state.sources[0];
+      if(next)navigate('/sources/'+next.id);else navigate('/sources');
+    }catch(e){setStatus(e.message,'failed');btn.disabled=false;btn.classList.remove('danger-confirm');btn.textContent='Delete'}
+  };
+  if(src.kind==='topic'){
+    $('runResearchBtn').onclick=async()=>{
+      const btn=$('runResearchBtn');
+      try{
+        btn.disabled=true;btn.innerHTML=spin('Researching...');
+        setStatus('Running research \\u00b7 30\\u201390s typical');
+        const artifact=await api('/api/sources/'+src.id+'/research',{method:'POST'});
+        setCost(artifact.costUsd);
+        setStatus('Research done \\u00b7 $'+Number(artifact.costUsd||0).toFixed(2)+' \\u00b7 '+(artifact.links||[]).length+' links','success');
+        await reloadSources();render();
+      }catch(e){setStatus(e.message,'failed');btn.disabled=false;btn.textContent='Run research'}
+    };
+    $('generateBtn').onclick=async()=>{
+      const btn=$('generateBtn');
+      try{
+        btn.disabled=true;btn.innerHTML=spin('Generating...');
+        setStatus('Generating posts...');
+        const data=await api('/api/sources/'+src.id+'/generate',{method:'POST',body:JSON.stringify({count:5})});
+        setCost(data.costUsd);
+        await reloadAll();
+        setStatus('Generated '+(data.posts||[]).length+' drafts \\u00b7 $'+Number(data.costUsd||0).toFixed(2),'success');
+      }catch(e){setStatus(e.message,'failed');btn.disabled=false;btn.textContent='Generate 5 posts'}
+    };
+  }else{
+    $('fetchFeedBtn').onclick=async()=>{
+      const btn=$('fetchFeedBtn');
+      try{
+        btn.disabled=true;btn.innerHTML=spin('Fetching...');
+        setStatus('Fetching viral feed via Birdclaw...');
+        await api('/api/sources/'+src.id+'/viral-fetch',{method:'POST'});
+        state.selectedFeedIds.clear();
+        await reloadSources();
+        setStatus('Fetched viral feed.','success');
+        render();
+      }catch(e){setStatus(e.message,'failed');btn.disabled=false;btn.textContent='Fetch viral feed'}
+    };
+    document.querySelectorAll('.main-tab').forEach(t=>{
+      t.onclick=()=>{const tab=t.dataset.tab;setViralTab(src.id,tab);render()};
+    });
+    document.querySelectorAll('.viral-tile').forEach(tile=>{
+      tile.onclick=(ev)=>{
+        if(ev.target.closest('[data-no-toggle]'))return;
+        const fid=tile.dataset.fid;
+        if(state.selectedFeedIds.has(fid))state.selectedFeedIds.delete(fid);else state.selectedFeedIds.add(fid);
+        render();
+      };
+    });
+    $('generateBtn').onclick=async()=>{
+      const btn=$('generateBtn');
+      if(!state.selectedFeedIds.size)return setStatus('Select at least one viral post first.','failed');
+      try{
+        btn.disabled=true;btn.innerHTML=spin('Generating...');
+        setStatus('Generating drafts from selected viral posts...');
+        const data=await api('/api/sources/'+src.id+'/generate',{method:'POST',body:JSON.stringify({selectedPostIds:[...state.selectedFeedIds]})});
+        setCost(data.costUsd);
+        state.selectedFeedIds.clear();
+        setViralTab(src.id,'drafts');
+        await reloadAll();
+        setStatus('Generated '+(data.posts||[]).length+' drafts \\u00b7 $'+Number(data.costUsd||0).toFixed(2),'success');
+      }catch(e){setStatus(e.message,'failed');btn.disabled=false;btn.textContent='Generate from selected ('+state.selectedFeedIds.size+')'}
+    };
+  }
+  // post-card handlers (delegated)
+  const dr=$('draftsRoot');
+  if(dr){
+    dr.addEventListener('click',handlePostClick);
+    dr.addEventListener('input',handlePostInput);
+  }
 }
-document.querySelectorAll('.nav-tab').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
-window.addEventListener('popstate',()=>showTab(routeToTab(window.location.pathname),{skipHistory:true}));
-$('refresh').onclick=()=>load().catch(e=>setStatus(e.message,'failed'));
-$('doctor').onclick=async()=>{try{setStatus('Checking Birdclaw...');const d=await api('/api/doctor');const b=d.birdclaw||{};const ok=b.installed&&b.authOk;setStatus([b.installed?'Birdclaw '+(b.version||'?')+' ✓':'Birdclaw ✗',b.authOk?'auth ok ✓':'auth ✗'].join('  ·  '),ok?'success':'failed')}catch(e){setStatus(e.message,'failed')}};
-$('chatSend').onclick=async()=>{const text=$('chatInput').value.trim();if(!text)return;const btn=$('chatSend');const orig=btn.textContent;try{btn.disabled=true;btn.textContent='Sending...';setStatus('Sending to OpenClaw session...');const data=await api('/api/chat',{method:'POST',body:JSON.stringify({message:text})});$('chatInput').value='';chatMessages=data.messages||[];chatTarget=data.target||chatTarget;renderOperator();renderChat();setStatus('OpenClaw replied in the UI chat.','success')}catch(e){setStatus(e.message,'failed');await loadChat().catch(()=>{})}finally{btn.disabled=false;btn.textContent=orig}};
+async function handlePostClick(ev){
+  const b=ev.target.closest('button');if(!b)return;
+  const c=ev.target.closest('.post');if(!c)return;
+  const id=c.dataset.id;const action=b.dataset.action;
+  try{
+    if(action==='save'){await api('/api/posts/'+id,{method:'PATCH',body:JSON.stringify({text:c.querySelector('[data-field="text"]').value})});setStatus('Saved.','success')}
+    if(action==='rewrite'){await api('/api/posts/'+id+'/rewrite-request',{method:'POST',body:JSON.stringify({instruction:c.querySelector('[data-field="rewrite"]').value})});setStatus('Rewrite request saved.','success')}
+    if(action==='delete'){
+      if(!pendingDelete.has(id)){const orig=b.textContent;b.classList.add('danger-confirm');b.textContent='Click again to delete';const t=setTimeout(()=>{if(pendingDelete.get(id)===t){pendingDelete.delete(id);b.classList.remove('danger-confirm');b.textContent=orig}},6000);pendingDelete.set(id,t);setStatus('Confirm: click again within 6s to delete.');return}
+      clearTimeout(pendingDelete.get(id));pendingDelete.delete(id);b.classList.remove('danger-confirm');b.innerHTML=spin('Deleting');b.disabled=true;
+      await api('/api/posts/'+id,{method:'DELETE'});setStatus('Draft deleted.','success');
+    }
+    if(action==='post'){
+      if(!pendingPost.has(id)){const orig=b.textContent;b.classList.add('danger-confirm');b.textContent='Click again to post';const t=setTimeout(()=>{if(pendingPost.get(id)===t){pendingPost.delete(id);b.classList.remove('danger-confirm');b.textContent=orig}},6000);pendingPost.set(id,t);setStatus('Confirm: click again within 6s to post.');return}
+      clearTimeout(pendingPost.get(id));pendingPost.delete(id);b.classList.remove('danger-confirm');b.innerHTML=spin('Posting');b.disabled=true;
+      const posted=await api('/api/posts/'+id+'/post',{method:'POST'});
+      if(posted.status==='posted')setStatus('Posted.','success');else setStatus('Post failed. Check card for result.','failed');
+    }
+    await reloadAll();
+  }catch(e){setStatus(e.message,'failed');b.disabled=false;if(action==='post')b.textContent='Post to X';if(action==='delete')b.textContent='Delete';b.classList.remove('danger-confirm')}
+}
+function handlePostInput(ev){
+  const t=ev.target;if(!t.matches||!t.matches('textarea[data-field="text"]'))return;
+  const c=t.closest('.post');const id=c&&c.dataset.id;if(!id)return;
+  const post=state.posts.find(p=>p.id===id);if(post)post.text=t.value;
+  if(autosaveTimers.has(id))clearTimeout(autosaveTimers.get(id));
+  setStatus('Editing... autosave pending.');
+  autosaveTimers.set(id,setTimeout(async()=>{try{await api('/api/posts/'+id,{method:'PATCH',body:JSON.stringify({text:t.value})});autosaveTimers.delete(id);setStatus('Autosaved.','success')}catch(e){setStatus('Autosave failed: '+e.message,'failed')}},700));
+}
+/* ── Modal ── */
+let modalBusy=false;
+function openModal(){
+  $('newSourceName').value='';
+  $('newSourceModal').classList.add('show');
+  setTimeout(()=>$('newSourceName').focus(),50);
+}
+function closeModal(){if(modalBusy)return;$('newSourceModal').classList.remove('show')}
+function bindModal(){
+  $('cancelNewSource').onclick=closeModal;
+  $('newSourceModal').addEventListener('click',ev=>{if(ev.target===$('newSourceModal'))closeModal()});
+  document.addEventListener('keydown',ev=>{if(ev.key==='Escape'&&$('newSourceModal').classList.contains('show'))closeModal()});
+  $('newSourceName').addEventListener('keydown',ev=>{if(ev.key==='Enter'&&!modalBusy)$('confirmNewSource').click()});
+  $('confirmNewSource').onclick=async()=>{
+    const name=$('newSourceName').value.trim();
+    if(!name){setStatus('Name is required.','failed');return}
+    const btn=$('confirmNewSource');const orig=btn.textContent;
+    try{
+      modalBusy=true;btn.disabled=true;btn.innerHTML=spin('Creating');
+      const src=await api('/api/sources',{method:'POST',body:JSON.stringify({kind:'topic',name,config:{angle:'',seedNotes:'',useTweetVoice:true}})});
+      await reloadSources();
+      $('newSourceModal').classList.remove('show');
+      navigate('/sources/'+src.id);
+      setStatus('Created source: '+src.name,'success');
+    }catch(e){setStatus(e.message,'failed')}finally{modalBusy=false;btn.disabled=false;btn.textContent=orig}
+  };
+}
+/* ── Routing ── */
+function navigate(path,opts={}){
+  if(!opts.skipHistory&&window.location.pathname!==path) history.pushState({},'',path);
+  applyRoute(path);
+}
+function applyRoute(path){
+  if(path==='/profile'){state.view='profile';render();return}
+  if(path==='/'||path==='/posts'||path==='/generate'||path==='/sources'){
+    state.view='source';
+    const mru=[...state.sources].sort((a,b)=>(b.updatedAt||'').localeCompare(a.updatedAt||''))[0];
+    if(mru){state.activeId=mru.id;if(window.location.pathname!=='/sources/'+mru.id)history.replaceState({},'','/sources/'+mru.id)}
+    else{state.activeId=null}
+    render();return;
+  }
+  const m=path.match(/^\\/sources\\/([^/]+)$/);
+  if(m){state.view='source';state.activeId=m[1];render();return}
+  state.view='source';render();
+}
+async function reloadSources(){const d=await api('/api/sources');state.sources=d.sources||[]}
+async function reloadPosts(){const d=await api('/api/posts');state.posts=d.posts||[]}
+async function reloadAll(){await Promise.all([reloadSources(),reloadPosts()]);render()}
+async function loadChat(){try{const c=await api('/api/chat');state.chatMessages=c.messages||[];state.chatTarget=c.target||null;renderOperator()}catch(e){renderOperator()}}
+function renderOperator(){const dot=$('chatDot');const connected=!!(state.chatTarget&&state.chatTarget.connected);dot.style.background=connected?'var(--success)':'var(--error)';dot.title=connected?'Connected':'Not connected'}
+async function init(){
+  try{
+    await reloadSources();
+    await reloadPosts();
+    try{const p=await api('/api/profile');state.profileSnapshots=p.profileSnapshots||[]}catch(e){}
+    await loadChat();
+    bindModal();
+    document.body.addEventListener('click',ev=>{const b=ev.target.closest('#newSourceBtn');if(b){openModal()}});
+    document.querySelectorAll('[data-nav]').forEach(b=>b.onclick=()=>navigate(b.dataset.route));
+    document.querySelectorAll('#sourceTabs').forEach(el=>el.addEventListener('click',ev=>{const t=ev.target.closest('.tab-pill');if(t)navigate('/sources/'+t.dataset.src)}));
+    window.addEventListener('popstate',()=>applyRoute(window.location.pathname));
+    applyRoute(window.location.pathname);
+    setStatus('Ready.');
+  }catch(e){setStatus(e.message,'failed')}
+}
+$('doctor').onclick=async()=>{try{setStatus('Checking system...');const d=await api('/api/doctor');const bc=d.birdclaw||{};const bi=d.bird||{};const c=d.claude||{};const ok=bc.installed&&bi.installed&&bi.authOk&&c.installed;setStatus(['Birdclaw '+(bc.installed?'\\u2713':'\\u2717'),'bird '+(bi.installed&&bi.authOk?(bi.handle?'@'+bi.handle:'')+' \\u2713':'\\u2717 ('+(bi.installed?'not logged in':'not installed')+')'),'Claude '+(c.installed?'\\u2713':'\\u2717')].join('  \\u00b7  '),ok?'success':'failed')}catch(e){setStatus(e.message,'failed')}};
+$('chatSend').onclick=async()=>{const text=$('chatInput').value.trim();if(!text)return;const btn=$('chatSend');const orig=btn.textContent;try{btn.disabled=true;btn.innerHTML=spin('Sending');setStatus('Sending to OpenClaw session...');const data=await api('/api/chat',{method:'POST',body:JSON.stringify({message:text})});$('chatInput').value='';state.chatMessages=data.messages||[];state.chatTarget=data.target||state.chatTarget;renderOperator();setStatus('Eigen received the message.','success')}catch(e){setStatus(e.message,'failed');await loadChat().catch(()=>{})}finally{btn.disabled=false;btn.textContent=orig}};
 $('chatInput').addEventListener('keydown',ev=>{if((ev.metaKey||ev.ctrlKey)&&ev.key==='Enter')$('chatSend').click()});
-$('posts').onclick=async ev=>{const b=ev.target.closest('button');if(!b)return;const c=ev.target.closest('.post');const id=c.dataset.id;const action=b.dataset.action;try{if(action==='save'){await api('/api/posts/'+id,{method:'PATCH',body:JSON.stringify({text:c.querySelector('[data-field="text"]').value})});setStatus('Saved.','success')}if(action==='rewrite'){await api('/api/posts/'+id+'/rewrite-request',{method:'POST',body:JSON.stringify({instruction:c.querySelector('[data-field="rewrite"]').value})});setStatus('Rewrite request saved.','success')}if(action==='post'){if(!pendingPost.has(id)){const orig=b.textContent;b.classList.add('danger-confirm');b.textContent='Click again to post';const t=setTimeout(()=>{if(pendingPost.get(id)===t){pendingPost.delete(id);b.classList.remove('danger-confirm');b.textContent=orig}},6000);pendingPost.set(id,t);setStatus('Confirm: click again within 6s to post.');return}clearTimeout(pendingPost.get(id));pendingPost.delete(id);b.classList.remove('danger-confirm');b.textContent='Posting...';b.disabled=true;await api('/api/posts/'+id+'/post',{method:'POST'});setStatus('Posted. Check card for result.','success')}await load()}catch(e){setStatus(e.message,'failed');b.disabled=false;b.textContent='Post to X';b.classList.remove('danger-confirm')}};
-load().then(()=>showTab(routeToTab(window.location.pathname),{skipHistory:true})).catch(e=>setStatus(e.message,'failed'));
-
-/* ── GENERATE TAB: Source switching ── */
-document.querySelectorAll('.source-tab').forEach(b=>b.onclick=()=>{
-  document.querySelectorAll('.source-tab').forEach(t=>t.classList.remove('active'));
-  b.classList.add('active');
-  const src=b.dataset.source;
-  $('feed-side').style.display=src==='feed'?'':'none';
-  $('direction-side').style.display=src==='direction'?'':'none';
-  $('gen-feed-view').style.display=src==='feed'?'':'none';
-  $('gen-dir-view').style.display=src==='direction'?'':'none';
-});
-
-/* ── FEED SOURCE ── */
-function renderFeedPosts(){
-  const grid=$('feed-posts-grid');const empty=$('feed-empty');const bar=$('feed-sel-bar');
-  if(!feedSnapshot||!feedSnapshot.posts||!feedSnapshot.posts.length){grid.innerHTML='';empty.style.display='';bar.style.display='none';return}
-  empty.style.display='none';bar.style.display='';
-  $('feedSelCount').textContent=selectedFeedIds.size+' of '+feedSnapshot.posts.length+' selected';
-  grid.innerHTML=feedSnapshot.posts.map(p=>{
-    const sel=selectedFeedIds.has(p.id);
-    return '<div class="feed-post'+(sel?' selected':'')+'" data-fid="'+esc(p.id)+'">'+'<div class="feed-post-meta">'+(p.author?'<span>@'+esc(String(p.author).replace(/^@/,''))+'</span>':'')+(p.createdAt?'<span class="ts">'+fmtDate(p.createdAt)+'</span>':'')+(sel?'<span style="color:var(--accent);margin-left:auto">✓ selected</span>':'')+'</div>'+'<div class="feed-post-body">'+esc(p.text)+'</div>'+(p.url?'<a href="'+esc(p.url)+'" target="_blank" rel="noopener" style="font-size:11px;color:var(--muted);word-break:break-all;margin-top:6px;display:block">'+esc(p.url.slice(0,70)+(p.url.length>70?'...':''))+'</a>':'')+'</div>';
-  }).join('')}
-$('fetchFeedBtn').onclick=async()=>{
-  try{
-    setStatus('Fetching trending posts...');
-    const topic=$('feedTopic').value.trim();
-    const data=await api('/api/feed'+(topic?'?topic='+encodeURIComponent(topic):''));
-    feedSnapshot=data;selectedFeedIds.clear();
-    renderFeedPosts();
-    $('feedGenerateSide').style.display='';
-    $('feedSideMeta').textContent=data.sampleCount+' trending posts fetched'+(topic?' for "'+topic+'"':' from home timeline');
-    setStatus('Fetched '+data.sampleCount+' trending posts.','success');
-  }catch(e){setStatus(e.message,'failed')}};
-$('feed-posts-grid').addEventListener('click',ev=>{
-  const card=ev.target.closest('.feed-post');if(!card)return;
-  const fid=card.dataset.fid;
-  if(selectedFeedIds.has(fid))selectedFeedIds.delete(fid);else selectedFeedIds.add(fid);
-  renderFeedPosts()});
-$('genFromFeedBtn').onclick=async()=>{
-  try{
-    const area=$('feedArea').value.trim()||$('feedTopic').value.trim();
-    if(!area)return setStatus('Enter your angle/topic for these trending posts first.','failed');
-    if(!feedSnapshot)return setStatus('Fetch trending posts first.','failed');
-    const btn=$('genFromFeedBtn');const orig=btn.textContent;btn.disabled=true;btn.textContent='Generating...';
-    setStatus('Generating your versions of selected trending posts...');
-    const selIds=selectedFeedIds.size>0?[...selectedFeedIds]:[];
-    const data=await api('/api/generate/feed',{method:'POST',body:JSON.stringify({area,feedSnapshotId:feedSnapshot.id,selectedPostIds:selIds,count:Math.max(selIds.length||5,1)})});
-    await load();showTab('posts');
-    setStatus('Generated '+data.posts.length+' trending drafts.','success');
-    btn.disabled=false;btn.textContent=orig;
-  }catch(e){setStatus(e.message,'failed');$('genFromFeedBtn').disabled=false;$('genFromFeedBtn').textContent='Generate my versions'}};
-
-/* ── DIRECTION SOURCE ── */
-async function loadDirections(){
-  const data=await api('/api/directions');directions=data.directions;renderDirList();updateDirSideMeta()}
-function renderDirList(){
-  const grid=$('dir-grid');const empty=$('dir-empty');
-  if(!directions.length){grid.innerHTML='';empty.style.display='';return}
-  empty.style.display='none';
-  grid.innerHTML=directions.map(d=>{const meta=[];if(d.references&&d.references.length)meta.push(d.references.length+' reference'+(d.references.length>1?'s':''));if(d.useTweetSamples!==false)meta.push('uses tweet samples');return '<div class="dir-card'+(d.id===activeDirId?' active-dir':'')+'" data-did="'+esc(d.id)+'"><div class="dir-name">'+esc(d.name)+'</div>'+(d.description?'<div class="dir-desc">'+esc(d.description)+'</div>':'')+'<div class="dir-meta-row">'+meta.join(' · ')+'</div></div>'}).join('')}
-function updateDirSideMeta(){
-  const meta=$('dirSideMeta');const genSide=$('dirGenerateSide');
-  if(activeDirId){const dir=directions.find(d=>d.id===activeDirId);meta.textContent=dir?'Active: '+dir.name:'';genSide.style.display=''}
-  else{meta.textContent='Select a topic from the list to generate.';genSide.style.display='none'}}
-$('dir-grid').addEventListener('click',ev=>{
-  const card=ev.target.closest('.dir-card');if(!card)return;
-  const did=card.dataset.did;
-  if(activeDirId===did){showDirEditor(did)}
-  else{activeDirId=did;renderDirList();updateDirSideMeta();showDirEditor(did)}});
-function showDirEditor(id){
-  const dir=id?directions.find(d=>d.id===id):null;
-  editingDirId=id||null;
-  $('dirEditLabel').textContent=dir?'Editing: '+dir.name:'New topic';
-  $('dirName').value=dir?dir.name:'';
-  $('dirDesc').value=dir?(dir.description||''):'';
-  $('dirRefs').value=dir?(dir.references||[]).join('\\n---\\n'):'';
-  $('dirUseTweets').checked=dir?dir.useTweetSamples!==false:true;
-  $('deleteDirBtn').style.display=dir?'':'none';
-  $('dir-editor-card').style.display=''}
-$('newDirBtn').onclick=()=>{editingDirId=null;activeDirId=null;showDirEditor(null);renderDirList();updateDirSideMeta()};
-$('cancelDirBtn').onclick=()=>{$('dir-editor-card').style.display='none';editingDirId=null};
-$('saveDirBtn').onclick=async()=>{
-  try{
-    const name=$('dirName').value.trim();if(!name)return setStatus('Topic name is required.','failed');
-    const description=$('dirDesc').value.trim();
-    const refsRaw=$('dirRefs').value.trim();
-    const references=refsRaw?refsRaw.split(/\\n---\\n/).map(r=>r.trim()).filter(Boolean):[];
-    const useTweetSamples=$('dirUseTweets').checked;
-    let dir;
-    if(editingDirId){dir=await api('/api/directions/'+editingDirId,{method:'PATCH',body:JSON.stringify({name,description,references,useTweetSamples})})}
-    else{dir=await api('/api/directions',{method:'POST',body:JSON.stringify({name,description,references,useTweetSamples})})}
-    activeDirId=dir.id;await loadDirections();$('dir-editor-card').style.display='none';editingDirId=null;
-    setStatus('Topic saved: '+dir.name,'success');
-  }catch(e){setStatus(e.message,'failed')}};
-$('deleteDirBtn').onclick=async()=>{
-  if(!editingDirId)return;
-  try{
-    await api('/api/directions/'+editingDirId,{method:'DELETE'});
-    if(activeDirId===editingDirId)activeDirId=null;
-    editingDirId=null;$('dir-editor-card').style.display='none';
-    await loadDirections();setStatus('Topic deleted.','success');
-  }catch(e){setStatus(e.message,'failed')}};
-$('genFromDirBtn').onclick=async()=>{
-  if(!activeDirId)return setStatus('Select a topic first.','failed');
-  try{
-    const btn=$('genFromDirBtn');const orig=btn.textContent;btn.disabled=true;btn.textContent='Generating...';
-    setStatus('Generating posts for selected topic...');
-    const data=await api('/api/generate/direction',{method:'POST',body:JSON.stringify({directionId:activeDirId,count:5})});
-    await load();showTab('posts');
-    setStatus('Generated '+data.posts.length+' topic drafts.','success');
-    btn.disabled=false;btn.textContent=orig;
-  }catch(e){setStatus(e.message,'failed');$('genFromDirBtn').disabled=false;$('genFromDirBtn').textContent='Generate topic posts'}};`;
+init();
+`;
 
   return [
     "<!doctype html>",
@@ -1070,8 +1691,7 @@ $('genFromDirBtn').onclick=async()=>{
     "<link href=\"https://fonts.bunny.net/css?family=geist:400,500,600|geist-mono:400,500|fraunces:500,600&display=swap\" rel=\"stylesheet\">",
     "<style>" + CSS + "</style></head><body>",
     HEADER,
-    "<main><aside class=\"side\">" + SIDEBAR_POSTS + SIDEBAR_GEN + SIDEBAR_CHAT + "</aside>",
-    "<section><div id=\"posts\" class=\"posts\"></div><div id=\"profile\" class=\"posts\" style=\"display:none\"></div>" + CONTENT_GEN + "</section></main>",
+    "<main><div id=\"appRoot\"></div></main>" + MODAL_HTML + CHAT_DOCK,
     "<script>" + JS + "</script></body></html>"
   ].join("\n");
 }
@@ -1092,9 +1712,10 @@ function startDashboard(port, host) {
   const server = http.createServer(async function(req, res) {
     try {
       const url = new URL(req.url, "http://" + req.headers.host);
-      if (req.method === "GET" && ["/", "/posts", "/generate", "/profile"].includes(url.pathname)) {
+      const isSourceRoute = url.pathname === "/sources" || url.pathname.startsWith("/sources/");
+      if (req.method === "GET" && (["/", "/posts", "/generate", "/profile"].includes(url.pathname) || isSourceRoute)) {
         if (url.pathname === "/") {
-          res.writeHead(302, { location: "/posts" });
+          res.writeHead(302, { location: "/sources" });
           res.end();
           return;
         }
@@ -1114,9 +1735,8 @@ function startDashboard(port, host) {
         sendJson(res, 200, { strategy: setStrategy(await readBody(req)) });
         return;
       }
-      if (req.method === "POST" && url.pathname === "/api/generate") {
-        const body = await readBody(req);
-        sendJson(res, 200, generatePosts({ values: { area: body.area || "", count: body.count || "5", limit: body.limit || "40", resource: body.resource || "home" } }));
+      if (url.pathname === "/api/generate" || url.pathname === "/api/generate/feed" || url.pathname === "/api/generate/direction") {
+        sendJson(res, 410, { error: "moved to POST /api/sources/:id/generate" });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/profile") {
@@ -1145,6 +1765,10 @@ function startDashboard(port, host) {
         sendJson(res, 200, updatePost(postMatch[1], await readBody(req)));
         return;
       }
+      if (req.method === "DELETE" && postMatch) {
+        sendJson(res, 200, deletePost(postMatch[1]));
+        return;
+      }
       const actionMatch = url.pathname.match(/^\/api\/posts\/([^/]+)\/(post|rewrite-request)$/);
       if (req.method === "POST" && actionMatch) {
         const body = await readBody(req);
@@ -1152,47 +1776,54 @@ function startDashboard(port, host) {
         else sendJson(res, 200, addRewriteRequest(actionMatch[1], body.instruction));
         return;
       }
-      if (req.method === "GET" && url.pathname === "/api/trends") {
-        sendJson(res, 200, runTrends({ values: { topic: url.searchParams.get("topic") || "", limit: url.searchParams.get("limit") || "40", resource: "home" } }));
+      if (url.pathname === "/api/trends" || url.pathname === "/api/feed" || url.pathname === "/api/feed/latest" || url.pathname === "/api/directions" || url.pathname.match(/^\/api\/directions\//)) {
+        sendJson(res, 410, { error: "moved to /api/sources" });
         return;
       }
-      if (req.method === "GET" && url.pathname === "/api/feed") {
-        sendJson(res, 200, fetchFeedSnapshot({ topic: url.searchParams.get("topic") || "", limit: url.searchParams.get("limit") || "40", resource: url.searchParams.get("resource") || "home" }));
+      if (req.method === "GET" && url.pathname === "/api/sources") {
+        const kind = url.searchParams.get("kind");
+        sendJson(res, 200, { sources: listSources(kind === "topic" || kind === "viral" ? kind : null) });
         return;
       }
-      if (req.method === "GET" && url.pathname === "/api/feed/latest") {
-        sendJson(res, 200, { feedSnapshot: readStore().feedSnapshots[0] || null });
+      if (req.method === "POST" && url.pathname === "/api/sources") {
+        sendJson(res, 200, createSource(await readBody(req)));
         return;
       }
-      if (req.method === "GET" && url.pathname === "/api/directions") {
-        sendJson(res, 200, { directions: readStore().directions });
+      const sourceMatch = url.pathname.match(/^\/api\/sources\/([^/]+)$/);
+      if (req.method === "GET" && sourceMatch) {
+        sendJson(res, 200, getSource(sourceMatch[1]));
         return;
       }
-      if (req.method === "POST" && url.pathname === "/api/directions") {
-        sendJson(res, 200, saveDirection(await readBody(req)));
+      if (req.method === "PATCH" && sourceMatch) {
+        sendJson(res, 200, updateSource(sourceMatch[1], await readBody(req)));
         return;
       }
-      const dirMatch = url.pathname.match(/^\/api\/directions\/([^/]+)$/);
-      if (req.method === "PATCH" && dirMatch) {
-        sendJson(res, 200, updateDirection(dirMatch[1], await readBody(req)));
+      if (req.method === "DELETE" && sourceMatch) {
+        sendJson(res, 200, deleteSource(sourceMatch[1]));
         return;
       }
-      if (req.method === "DELETE" && dirMatch) {
-        sendJson(res, 200, deleteDirection(dirMatch[1]));
-        return;
-      }
-      if (req.method === "POST" && url.pathname === "/api/generate/feed") {
-        sendJson(res, 200, generateFromFeed(await readBody(req)));
-        return;
-      }
-      if (req.method === "POST" && url.pathname === "/api/generate/direction") {
-        sendJson(res, 200, generateFromDirection(await readBody(req)));
+      const sourceActionMatch = url.pathname.match(/^\/api\/sources\/([^/]+)\/(research|viral-fetch|generate|posts)$/);
+      if (sourceActionMatch) {
+        const id = sourceActionMatch[1];
+        const action = sourceActionMatch[2];
+        if (req.method === "GET" && action === "posts") { sendJson(res, 200, { posts: getPostsForSource(id) }); return; }
+        if (req.method === "POST" && action === "research") { sendJson(res, 200, runResearch(id)); return; }
+        if (req.method === "POST" && action === "viral-fetch") { sendJson(res, 200, { lastFeedSnapshot: viralFetch(id) }); return; }
+        if (req.method === "POST" && action === "generate") { sendJson(res, 200, generateForSource(id, await readBody(req))); return; }
+        sendJson(res, 405, { error: "method not allowed" });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/doctor") {
-        const birdVersion = birdclaw(["--version"]);
-        const auth = birdclaw(["auth", "status", "--json"]);
-        sendJson(res, 200, { birdclaw: { installed: birdVersion.ok, version: birdVersion.stdout.trim(), authOk: auth.ok, auth: safeJson(auth.stdout.trim()), stderr: auth.stderr.trim() } });
+        const birdclawVersion = birdclaw(["--version"]);
+        const birdclawAuth = birdclaw(["auth", "status", "--json"]);
+        const birdVersion = bird(["--version"], 10000);
+        const birdAuth = birdAuthStatus();
+        const claudeVersion = run(CLAUDE_BIN, ["--version"], { timeout: 10000 });
+        sendJson(res, 200, {
+          birdclaw: { installed: birdclawVersion.ok, version: birdclawVersion.stdout.trim(), authOk: birdclawAuth.ok, auth: safeJson(birdclawAuth.stdout.trim()), stderr: birdclawAuth.stderr.trim(), note: "Used for posting drafts via Birdclaw. Viral feed reads come via bird." },
+          bird: { installed: birdVersion.ok, version: birdVersion.stdout.trim(), authOk: birdAuth.ok, handle: birdAuth.handle, status: birdAuth.message, note: birdAuth.ok ? null : "Log in to x.com in Chrome (or Firefox) — bird reads browser cookies." },
+          claude: { installed: claudeVersion.ok, version: claudeVersion.stdout.trim(), error: claudeVersion.error || (claudeVersion.ok ? null : claudeVersion.stderr.trim()) }
+        });
         return;
       }
       sendJson(res, 404, { error: "not found" });
@@ -1215,7 +1846,7 @@ async function main() {
   const cmd = parts[0] || "help";
   const rest = parts.slice(1);
   if (cmd === "help" || cmd === "--help" || cmd === "-h") {
-    output("xsquared commands:\n  doctor [--json]\n  strategy [--json]\n  strategy-set --area <posting area> [--json]\n  trends [--topic <topic>] [--limit 40] [--resource home] [--json]\n  generate [--area <posting area>] [--count 5] [--limit 40] [--json]\n  profile-learn [--handle @you] [--limit 200] [--query <query>] [--json]\n  profile [--json]\n  save --text <text> [--topic <topic>] [--angle <angle>] [--score 80] [--notes <notes>]\n  import-json <file>\n  list [--json]\n  update <post-id> [--text <text>] [--status <status>] [--notes <notes>] [--score <score>]\n  rewrite-request <post-id> [--instruction <text>]\n  rewrite-requests [--json]\n  post <post-id> [--account acct_primary]\n  dashboard [--port 3888] [--host 127.0.0.1]");
+    output("xsquared commands:\n  doctor [--json]\n  strategy [--json]\n  strategy-set --area <posting area> [--json]\n  trends [--topic <topic>] [--limit 40] [--resource home] [--json]\n  sources [--kind topic|viral] [--json]\n  source-new --kind <topic|viral> --name <name> [--angle <a>] [--notes <n>] [--filter <f>] [--resource home|following|for-you] [--limit 40] [--no-voice] [--json]\n  source-edit <source-id> [--name ...] [--angle ...] [--notes ...] [--filter ...] [--resource ...] [--limit N]\n  source-delete <source-id>\n  research <source-id> [--json]\n  viral-fetch <source-id> [--json]\n  generate <source-id> [--count 5] [--selected id,id,id] [--json]\n  profile-learn [--handle @you] [--limit 200] [--query <query>] [--json]\n  profile [--json]\n  save --text <text> [--topic <topic>] [--angle <angle>] [--score 80] [--notes <notes>]\n  import-json <file>\n  list [--source <source-id>] [--json]\n  update <post-id> [--text <text>] [--status <status>] [--notes <notes>] [--score <score>]\n  rewrite-request <post-id> [--instruction <text>]\n  rewrite-requests [--json]\n  post <post-id> [--account acct_primary]\n  dashboard [--port 3888] [--host 127.0.0.1]\n\nEnv:\n  XSQUARED_CLAUDE_MODEL (default: sonnet)\n  XSQUARED_RESEARCH_BUDGET_USD (default: 0.50)\n  XSQUARED_DISABLE_LLM=1 forces template fallback");
     return;
   }
   if (cmd === "doctor") {
@@ -1238,9 +1869,73 @@ async function main() {
     output(runTrends(opts), Boolean(opts.values.json));
     return;
   }
+  if (cmd === "sources") {
+    const opts = parseArgs({ args: rest, options: { kind: { type: "string" }, json: { type: "boolean" } } });
+    const kind = (opts.values.kind === "topic" || opts.values.kind === "viral") ? opts.values.kind : null;
+    const sources = listSources(kind);
+    if (opts.values.json) output(sources, true);
+    else output(sources.map(function(s) { return s.id + " [" + s.kind + "] " + s.name; }).join("\n") || "No sources.");
+    return;
+  }
+  if (cmd === "source-new") {
+    const opts = parseArgs({ args: rest, options: { kind: { type: "string" }, name: { type: "string" }, angle: { type: "string" }, notes: { type: "string" }, filter: { type: "string" }, resource: { type: "string" }, limit: { type: "string" }, "no-voice": { type: "boolean" }, json: { type: "boolean" } } });
+    const kind = opts.values.kind === "viral" ? "viral" : "topic";
+    const config = kind === "topic"
+      ? { angle: opts.values.angle || "", seedNotes: opts.values.notes || "", useTweetVoice: !opts.values["no-voice"] }
+      : { filter: opts.values.filter || "", resource: opts.values.resource || "home", limit: Number(opts.values.limit || "40") };
+    output(createSource({ kind, name: opts.values.name || "", config }), Boolean(opts.values.json));
+    return;
+  }
+  if (cmd === "source-edit") {
+    const id = requireArg(rest[0], "source-id");
+    const opts = parseArgs({ args: rest.slice(1), options: { name: { type: "string" }, angle: { type: "string" }, notes: { type: "string" }, filter: { type: "string" }, resource: { type: "string" }, limit: { type: "string" }, "use-voice": { type: "boolean" }, "no-voice": { type: "boolean" }, archived: { type: "boolean" }, json: { type: "boolean" } } });
+    const config: any = {};
+    if (opts.values.angle !== undefined) config.angle = opts.values.angle;
+    if (opts.values.notes !== undefined) config.seedNotes = opts.values.notes;
+    if (opts.values["use-voice"]) config.useTweetVoice = true;
+    if (opts.values["no-voice"]) config.useTweetVoice = false;
+    if (opts.values.filter !== undefined) config.filter = opts.values.filter;
+    if (opts.values.resource !== undefined) config.resource = opts.values.resource;
+    if (opts.values.limit !== undefined) config.limit = Number(opts.values.limit);
+    const updates: any = { config };
+    if (opts.values.name !== undefined) updates.name = opts.values.name;
+    if (opts.values.archived !== undefined) updates.archived = Boolean(opts.values.archived);
+    output(updateSource(id, updates), Boolean(opts.values.json));
+    return;
+  }
+  if (cmd === "source-delete") {
+    const id = requireArg(rest[0], "source-id");
+    output(deleteSource(id), true);
+    return;
+  }
+  if (cmd === "research") {
+    const id = requireArg(rest[0], "source-id");
+    const opts = parseArgs({ args: rest.slice(1), options: { json: { type: "boolean" } } });
+    output(runResearch(id), Boolean(opts.values.json));
+    return;
+  }
+  if (cmd === "viral-fetch") {
+    const id = requireArg(rest[0], "source-id");
+    const opts = parseArgs({ args: rest.slice(1), options: { json: { type: "boolean" } } });
+    output(viralFetch(id), Boolean(opts.values.json));
+    return;
+  }
   if (cmd === "generate") {
-    const opts = parseArgs({ args: rest, options: { area: { type: "string" }, count: { type: "string" }, limit: { type: "string" }, resource: { type: "string" }, json: { type: "boolean" } } });
-    output(generatePosts(opts), Boolean(opts.values.json));
+    let sourceId = rest[0] && !rest[0].startsWith("-") ? rest[0] : null;
+    const argTail = sourceId ? rest.slice(1) : rest;
+    const opts = parseArgs({ args: argTail, options: { count: { type: "string" }, selected: { type: "string" }, "source-id": { type: "string" }, json: { type: "boolean" } } });
+    if (!sourceId && opts.values["source-id"]) sourceId = opts.values["source-id"];
+    if (!sourceId) {
+      const topicSources = listSources("topic");
+      if (topicSources.length === 1) {
+        process.stderr.write("xsquared generate: --source-id not provided; using single topic source " + topicSources[0].id + " (deprecation: pass <source-id> explicitly)\n");
+        sourceId = topicSources[0].id;
+      } else {
+        throw new Error("generate requires a <source-id> argument. Run 'xsquared sources' to list them.");
+      }
+    }
+    const selected = opts.values.selected ? String(opts.values.selected).split(",").map(function(s) { return s.trim(); }).filter(Boolean) : [];
+    output(generateForSource(sourceId, { count: opts.values.count ? Number(opts.values.count) : 5, selectedPostIds: selected }), Boolean(opts.values.json));
     return;
   }
   if (cmd === "profile-learn") {
@@ -1265,8 +1960,9 @@ async function main() {
     return;
   }
   if (cmd === "list") {
-    const opts = parseArgs({ args: rest, options: { json: { type: "boolean" } } });
-    const posts = readStore().posts;
+    const opts = parseArgs({ args: rest, options: { source: { type: "string" }, json: { type: "boolean" } } });
+    let posts = readStore().posts;
+    if (opts.values.source) posts = posts.filter(function(p) { return p.sourceId === opts.values.source; });
     if (opts.values.json) output(posts, true);
     else output(posts.map(function(p) { return p.id + " [" + p.status + "] " + (p.topic || "untitled") + ": " + p.text.slice(0, 120); }).join("\n") || "No posts.");
     return;

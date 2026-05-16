@@ -16,37 +16,48 @@ Quick start:
     npm run check
     npm run dashboard
 
-Then open the dashboard URL printed by the command. Dashboard tabs are routable:
+Then open the dashboard URL printed by the command. Each source has its own routable tab:
 
-    http://127.0.0.1:3888/posts
-    http://127.0.0.1:3888/generate
+    http://127.0.0.1:3888/sources           (most-recent source or empty state)
+    http://127.0.0.1:3888/sources/<id>      (a specific topic or viral source)
     http://127.0.0.1:3888/profile
 
 OpenClaw workflow:
 
-- Generate 5 X posts about AI agents using xsquared.
-- Set my xsquared posting area to Google Ads for small business.
+- Create a new topic source for AI agents and run research.
+- Generate 5 posts from the AI agents source.
 - Rewrite the newest xsquared draft.
 - Open the xsquared dashboard.
+
+Sources, the new content model:
+
+- A **topic source** has an angle + seed notes. Run `research` to call `claude -p` with WebSearch/WebFetch and produce a research artifact (summaries + facts + links + cost). Then `generate` produces 5 LLM-drafted posts grounded in the research.
+- A **viral source** has a filter (e.g. "AI agents"), a Birdclaw resource (home / following / for-you), and a limit. Run `viral-fetch` to pull the current feed; select 1 or more posts; then `generate` produces one LLM-drafted reply-style post per selection.
+- Both flows fall back to local template generation when the `claude` CLI is missing or `XSQUARED_DISABLE_LLM=1` is set.
 
 CLI:
 
     npm run build
-    node dist/xsquared.js doctor
-    node dist/xsquared.js strategy-set --area "Google Ads for small business"
-    node dist/xsquared.js trends --topic "AI agents" --limit 40
-    node dist/xsquared.js generate --area "Google Ads for small business" --count 5
-    node dist/xsquared.js profile-learn --handle "@therealtongchen" --limit 200
-    node dist/xsquared.js profile --json
-    node dist/xsquared.js save --topic "AI agents" --angle "operator leverage" --text "..."
-    node dist/xsquared.js list
-    node dist/xsquared.js dashboard --port 3888
+    node dist/xsquared.js doctor                                       # checks birdclaw + claude
+    node dist/xsquared.js sources                                      # list sources
+    node dist/xsquared.js source-new --kind topic --name "AI agents" --angle "..." --notes "..."
+    node dist/xsquared.js source-new --kind viral --name "AI feed" --filter "AI agents"
+    node dist/xsquared.js research <source-id>                         # LLM research, ~30-90s
+    node dist/xsquared.js viral-fetch <source-id>                      # pull viral feed
+    node dist/xsquared.js generate <source-id> --count 5               # 5 LLM drafts
+    node dist/xsquared.js generate <source-id> --selected id1,id2      # viral: only these
+    node dist/xsquared.js list [--source <source-id>] [--json]
     node dist/xsquared.js post <post-id>
+    node dist/xsquared.js profile-learn --handle "@therealtongchen"
+    node dist/xsquared.js dashboard --port 3888
 
-The dashboard splits generation and review into two sources:
+Env vars for the LLM pipeline:
 
-- Topic: define one or many topics, add angle/reference material, and generate posts for the selected topic.
-- Trending: fetch viral or relevant feed posts, select the ones worth adapting, and generate your versions.
+- `XSQUARED_CLAUDE_MODEL` (default `sonnet`) — model alias passed to `claude -p`.
+- `XSQUARED_RESEARCH_BUDGET_USD` (default `0.50`) — max budget per research call.
+- `XSQUARED_GENERATE_BUDGET_USD` (default `0.50`) — max budget per generation call.
+- `XSQUARED_DISABLE_LLM=1` — force the template fallback (offline / cost-free).
+- `XSQUARED_CLAUDE_BIN` — override the `claude` binary path.
 
 The Posts tab groups drafts by Topic and Trending. It supports editing drafts, recording rewrite requests for OpenClaw, inspecting what xsquared has learned about your writing style, and posting approved drafts through birdclaw compose post.
 
